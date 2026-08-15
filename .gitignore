@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# CMake / C++
+build/
+cmake-build-*/
+*.o
+*.so
+*.dylib
+*.a
+
+# macOS
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
