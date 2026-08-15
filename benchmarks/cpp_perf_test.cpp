@@ -1,108 +1,54 @@
 #include "pcsr_graph.hpp"
 #include <iostream>
-#include <chrono>
 #include <vector>
+#include <chrono>
 #include <random>
 #include <iomanip>
 
-// Helper structure for pre-generating workloads
-struct EdgeRequest {
-    uint32_t src;
-    uint32_t dst;
-    uint32_t timestamp;
-};
+int main() {
+    const uint32_t NUM_NODES = 100'000;
+    const uint32_t NUM_EDGES = 10'000'000;
+    
+    std::cout << "Generating " << NUM_EDGES << " random edges...\n";
+    
+    std::vector<uint32_t> srcs(NUM_EDGES);
+    std::vector<uint32_t> dsts(NUM_EDGES);
+    std::vector<uint32_t> timestamps(NUM_EDGES);
 
-// Benchmark harness
-void run_benchmark(const std::string& name, PCSRGraph& graph, const std::vector<EdgeRequest>& edges) {
-    std::cout << "[Running] " << name << " (" << edges.size() << " edges)..." << std::endl;
+    // Random number generation for realistic scatter
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<uint32_t> dist_node(0, NUM_NODES - 1);
+    std::uniform_int_distribution<uint32_t> dist_ts(1000000, 2000000);
 
+    for (uint32_t i = 0; i < NUM_EDGES; ++i) {
+        srcs[i] = dist_node(rng);
+        dsts[i] = dist_node(rng);
+        timestamps[i] = dist_ts(rng);
+    }
+
+    std::cout << "Initializing PCSRGraph (100k nodes, 15M capacity)...\n";
+    // 500MB arena allocation to comfortably hold everything without hitting OS limits
+    PCSRGraph graph(NUM_NODES, NUM_EDGES + 5'000'000, 500 * 1024 * 1024);
+
+    std::cout << "Starting pure C++ insertion stress test...\n";
+    
     auto start = std::chrono::high_resolution_clock::now();
 
-    for (const auto& edge : edges) {
-        graph.insert_edge(edge.src, edge.dst, edge.timestamp);
+    for (uint32_t i = 0; i < NUM_EDGES; ++i) {
+        graph.insert_edge(srcs[i], dsts[i], timestamps[i]);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = end - start;
     
     double seconds = diff.count();
-    double edges_per_sec = edges.size() / seconds;
+    double throughput = NUM_EDGES / seconds;
 
-    std::cout << "  -> Time:       " << std::fixed << std::setprecision(4) << seconds << " seconds\n";
-    std::cout << "  -> Throughput: " << std::fixed << std::setprecision(0) << edges_per_sec << " edges/sec\n\n";
-}
-
-int main() {
-    const uint32_t NUM_VERTICES = 1'000'000;
-    const uint32_t INITIAL_CAPACITY = 5'000'000;
-    const uint32_t NUM_INSERTS = 3'000'000;
-
-    std::mt19937 rng(42); // Fixed seed for reproducibility
-    
-    // =========================================================================
-    // Use Case 1: Sequential Insertion (Best Case - Zero Rebalancing)
-    // =========================================================================
-    {
-        PCSRGraph graph(NUM_VERTICES, INITIAL_CAPACITY);
-        std::vector<EdgeRequest> workload(NUM_INSERTS);
-        
-        for (uint32_t i = 0; i < NUM_INSERTS; ++i) {
-            workload[i] = {i % NUM_VERTICES, (i + 1) % NUM_VERTICES, i};
-        }
-        
-        run_benchmark("Sequential Insertion (Perfect Distribution)", graph, workload);
-    }
-
-    // =========================================================================
-    // Use Case 2: Uniform Random Distribution (Real-world Baseline)
-    // =========================================================================
-    {
-        PCSRGraph graph(NUM_VERTICES, INITIAL_CAPACITY);
-        std::vector<EdgeRequest> workload(NUM_INSERTS);
-        std::uniform_int_distribution<uint32_t> dist(0, NUM_VERTICES - 1);
-        
-        for (uint32_t i = 0; i < NUM_INSERTS; ++i) {
-            workload[i] = {dist(rng), dist(rng), i};
-        }
-        
-        run_benchmark("Uniform Random Graph (Standard Rebalancing)", graph, workload);
-    }
-
-    // =========================================================================
-    // Use Case 3: The "Super-Node" Hotspot (Worst Case - Heavy Local Shifts)
-    // =========================================================================
-    // Simulates an influencer on Twitter or a central routing hub.
-    // 90% of edges go to node 0, causing massive cascading local window rebalances.
-    {
-        PCSRGraph graph(NUM_VERTICES, INITIAL_CAPACITY);
-        std::vector<EdgeRequest> workload(NUM_INSERTS);
-        std::uniform_int_distribution<uint32_t> dist_all(0, NUM_VERTICES - 1);
-        std::uniform_int_distribution<int> chance(1, 100);
-        
-        for (uint32_t i = 0; i < NUM_INSERTS; ++i) {
-            uint32_t src = (chance(rng) <= 90) ? 0 : dist_all(rng);
-            workload[i] = {src, dist_all(rng), i};
-        }
-        
-        run_benchmark("Super-Node Hotspot (90% traffic to Node 0)", graph, workload);
-    }
-
-    // =========================================================================
-    // Use Case 4: Global Resize Panic (Forcing Dynamic Allocations)
-    // =========================================================================
-    // Start with a tiny capacity to force multiple Stop-The-World global resizes.
-    {
-        PCSRGraph graph(NUM_VERTICES, 1'000'000); // Only 1M capacity
-        std::vector<EdgeRequest> workload(NUM_INSERTS); 
-        std::uniform_int_distribution<uint32_t> dist(0, NUM_VERTICES - 1);
-        
-        // Inserting 3M edges into 1M capacity guarantees at least 2 global resizes
-        for (uint32_t i = 0; i < NUM_INSERTS; ++i) {
-            workload[i] = {dist(rng), dist(rng), i};
-        }
-        
-        run_benchmark("Global Resize Panic (Forcing PMA Capacity Doubling)", graph, workload);
-    }
+    std::cout << "======================================\n";
+    std::cout << "Total Edges Inserted : " << NUM_EDGES << "\n";
+    std::cout << "Total Time Taken     : " << std::fixed << std::setprecision(4) << seconds << " seconds\n";
+    std::cout << "C++ Throughput       : " << std::fixed << std::setprecision(0) << throughput << " inserts/second\n";
+    std::cout << "======================================\n";
 
     return 0;
 }

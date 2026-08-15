@@ -1,4 +1,4 @@
-#pragma once
+
 #include "pcsr_graph.hpp"
 #include <stdexcept>
 #include <string>
@@ -15,20 +15,20 @@ static inline size_t pad_to_64(size_t size) {
     return (size + 63) & ~63; // Bitwise magic to snap to 64-byte boundaries
 }
 
-PCSRGraph::PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity)
-    : num_vertices(max_vertices), edge_capacity(initial_edge_capacity) {
+PCSRGraph::PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity, size_t arena_bytes)
+    : num_vertices(max_vertices), edge_capacity(initial_edge_capacity), arena(arena_bytes) {
 
     vertex_offsets = static_cast<uint32_t*>(
-        std::aligned_alloc(64, pad_to_64((num_vertices + 1) * sizeof(uint32_t))));
+        arena.allocate(pad_to_64((num_vertices + 1) * sizeof(uint32_t))));
+        
     edges = static_cast<TemporalEdge*>(
-        std::aligned_alloc(64, pad_to_64(edge_capacity * sizeof(TemporalEdge))));
+        arena.allocate(pad_to_64(edge_capacity * sizeof(TemporalEdge))));
 
-    scratchpad_edges = static_cast<TemporalEdge*>(std::aligned_alloc(64, pad_to_64(edge_capacity * sizeof(TemporalEdge))));
-    scratchpad_counts = static_cast<uint32_t*>(std::aligned_alloc(64, pad_to_64(num_vertices * sizeof(uint32_t))));
-
-    if (!vertex_offsets || !edges || !scratchpad_edges || !scratchpad_counts) {
-        throw std::runtime_error("CRITICAL: std::aligned_alloc returned nullptr. Out of RAM or invalid alignment.");
-    }
+    scratchpad_edges = static_cast<TemporalEdge*>(
+        arena.allocate(pad_to_64(edge_capacity * sizeof(TemporalEdge))));
+        
+    scratchpad_counts = static_cast<uint32_t*>(
+        arena.allocate(pad_to_64(num_vertices * sizeof(uint32_t))));
 
     for(uint32_t i = 0 ;i < edge_capacity; i++){
         edges[i] = {EMPTY_GAP,0};
@@ -40,10 +40,6 @@ PCSRGraph::PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity)
 }
 
 PCSRGraph::~PCSRGraph() {
-    std::free(vertex_offsets);
-    std::free(edges);
-    std::free(scratchpad_edges);
-    std::free(scratchpad_counts);
 }
 
 void PCSRGraph::insert_edge(uint32_t src, uint32_t dst, uint32_t timestamp){
@@ -162,9 +158,6 @@ void PCSRGraph::resize_pma(){
     }
     vertex_offsets[num_vertices] = new_capacity;
 
-    std::free(edges);
-    std::free(scratchpad_edges);
-    
     edges = new_edges;
     scratchpad_edges = new_scratch;
     edge_capacity = new_capacity;
