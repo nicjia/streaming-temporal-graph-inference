@@ -88,14 +88,23 @@ PCSRGraph::PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity, size
         arena.allocate(static_cast<size_t>(num_vertices) * sizeof(uint32_t)));
     edges = static_cast<TemporalEdge*>(
         arena.allocate(static_cast<size_t>(edge_capacity) * sizeof(TemporalEdge)));
+    edge_relations = static_cast<EdgeRelation*>(
+        arena.allocate(static_cast<size_t>(edge_capacity) * sizeof(EdgeRelation)));
     scratchpad_edges = static_cast<TemporalEdge*>(
         arena.allocate(static_cast<size_t>(edge_capacity) * sizeof(TemporalEdge)));
+    scratchpad_relations = static_cast<EdgeRelation*>(
+        arena.allocate(static_cast<size_t>(edge_capacity) * sizeof(EdgeRelation)));
     scratchpad_counts = static_cast<uint32_t*>(
         arena.allocate(static_cast<size_t>(num_vertices) * sizeof(uint32_t)));
     scratchpad_gaps = static_cast<uint32_t*>(
         arena.allocate(static_cast<size_t>(num_vertices) * sizeof(uint32_t)));
 
     fill_gaps(edges, edge_capacity);
+    // memset writes bytes, so this is only a correct fill because
+    // RELATION_UNKNOWN is zero. Asserted rather than assumed.
+    static_assert(RELATION_UNKNOWN == 0, "byte-fill assumes a zero sentinel");
+    std::memset(edge_relations, 0,
+                static_cast<size_t>(edge_capacity) * sizeof(EdgeRelation));
     std::memset(vertex_counts, 0, static_cast<size_t>(num_vertices) * sizeof(uint32_t));
 
     // Empty graph: every slot is spare, so this hands each vertex an equal
@@ -114,7 +123,8 @@ PCSRGraph::PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity, size
 PCSRGraph::~PCSRGraph() {
 }
 
-void PCSRGraph::insert_edge(uint32_t src, uint32_t dst, uint32_t timestamp) {
+void PCSRGraph::insert_edge(uint32_t src, uint32_t dst, uint32_t timestamp,
+                            EdgeRelation relation) {
     if (src >= num_vertices || dst >= num_vertices) {
         throw std::out_of_range("requested node is nonexistent. nodes go from 0 to " +
                                 std::to_string(num_vertices - 1) + ".");
@@ -128,15 +138,17 @@ void PCSRGraph::insert_edge(uint32_t src, uint32_t dst, uint32_t timestamp) {
     // without scanning. This is the O(1) common case.
     if (count < region) [[likely]] {
         edges[start + count] = {dst, timestamp};
+        edge_relations[start + count] = relation;
         vertex_counts[src] = count + 1;
         ++num_edges;
         return;
     }
 
-    rebalance_and_insert(src, dst, timestamp);
+    rebalance_and_insert(src, dst, timestamp, relation);
 }
 
-void PCSRGraph::rebalance_and_insert(uint32_t src, uint32_t dst, uint32_t timestamp) {
+void PCSRGraph::rebalance_and_insert(uint32_t src, uint32_t dst, uint32_t timestamp,
+                                     EdgeRelation relation) {
     // Walk up power-of-two windows of vertices centred on src's aligned block
     // until one is loose enough to absorb the insert. Doubling (rather than
     // widening by one vertex at a time) is what makes the amortized cost
@@ -180,20 +192,21 @@ void PCSRGraph::rebalance_and_insert(uint32_t src, uint32_t dst, uint32_t timest
         const uint64_t limit = (win_capacity * 3) / 4;
 
         if (occupied <= limit) {
-            redistribute(v_start, v_end, src, dst, timestamp);
+            redistribute(v_start, v_end, src, dst, timestamp, relation);
             return;
         }
 
         if (full_array) [[unlikely]] {
             resize_pma(src);
-            insert_edge(src, dst, timestamp); // retry against the doubled PMA
+            insert_edge(src, dst, timestamp, relation); // retry against the doubled PMA
             return;
         }
     }
 }
 
 void PCSRGraph::redistribute(uint32_t v_start, uint32_t v_end,
-                             uint32_t src, uint32_t dst, uint32_t timestamp) {
+                             uint32_t src, uint32_t dst, uint32_t timestamp,
+                             EdgeRelation relation) {
     const uint32_t win_st = vertex_offsets[v_start];
     const uint32_t win_end = vertex_offsets[v_end + 1];
     const uint32_t win_capacity = win_end - win_st;
@@ -210,9 +223,13 @@ void PCSRGraph::redistribute(uint32_t v_start, uint32_t v_end,
         uint32_t count = vertex_counts[v];
 
         for (uint32_t i = 0; i < count; ++i) {
+            // Relations move in lockstep with their edges; the two arrays are
+            // only meaningful while their indices agree.
+            scratchpad_relations[scratch_idx] = edge_relations[region_start + i];
             scratchpad_edges[scratch_idx++] = edges[region_start + i];
         }
         if (v == src) {
+            scratchpad_relations[scratch_idx] = relation;
             scratchpad_edges[scratch_idx++] = {dst, timestamp};
             ++count;
         }
@@ -240,7 +257,9 @@ void PCSRGraph::redistribute(uint32_t v_start, uint32_t v_end,
         vertex_offsets[v_start + i] = cursor;
         vertex_counts[v_start + i] = count;
         for (uint32_t j = 0; j < count; ++j) {
-            edges[cursor + j] = scratchpad_edges[consumed++];
+            edges[cursor + j] = scratchpad_edges[consumed];
+            edge_relations[cursor + j] = scratchpad_relations[consumed];
+            ++consumed;
         }
         cursor += count + scratchpad_gaps[i];
     }
@@ -269,11 +288,17 @@ void PCSRGraph::resize_pma(uint32_t hot) {
         arena.allocate(static_cast<size_t>(new_capacity) * sizeof(TemporalEdge)));
     TemporalEdge* new_scratch = static_cast<TemporalEdge*>(
         arena.allocate(static_cast<size_t>(new_capacity) * sizeof(TemporalEdge)));
+    EdgeRelation* new_relations = static_cast<EdgeRelation*>(
+        arena.allocate(static_cast<size_t>(new_capacity) * sizeof(EdgeRelation)));
+    EdgeRelation* new_scratch_relations = static_cast<EdgeRelation*>(
+        arena.allocate(static_cast<size_t>(new_capacity) * sizeof(EdgeRelation)));
     // A fresh offsets array: the old one has to stay readable while we walk it.
     uint32_t* new_offsets = static_cast<uint32_t*>(
         arena.allocate((static_cast<size_t>(num_vertices) + 1) * sizeof(uint32_t)));
 
     fill_gaps(new_edges, new_capacity);
+    std::memset(new_relations, 0,
+                static_cast<size_t>(new_capacity) * sizeof(EdgeRelation));
 
     const uint32_t spare = new_capacity - static_cast<uint32_t>(num_edges);
     distribute_gaps(vertex_counts, num_vertices, num_edges, spare, scratchpad_gaps, hot);
@@ -286,13 +311,16 @@ void PCSRGraph::resize_pma(uint32_t hot) {
         new_offsets[v] = cursor;
         for (uint32_t i = 0; i < count; ++i) {
             new_edges[cursor + i] = edges[old_start + i];
+            new_relations[cursor + i] = edge_relations[old_start + i];
         }
         cursor += count + scratchpad_gaps[v];
     }
     new_offsets[num_vertices] = new_capacity;
 
     edges = new_edges;
+    edge_relations = new_relations;
     scratchpad_edges = new_scratch;
+    scratchpad_relations = new_scratch_relations;
     vertex_offsets = new_offsets;
     edge_capacity = new_capacity;
 }

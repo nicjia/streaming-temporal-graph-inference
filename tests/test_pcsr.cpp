@@ -226,6 +226,68 @@ void test_chronological_order_preserved() {
     check_invariants(g, "chronological");
 }
 
+void test_edge_relations() {
+    // Relations live in an array parallel to the edges. Parallel arrays are
+    // exactly the kind of thing that drifts out of sync during a rebalance, and
+    // when they do nothing crashes -- edges just silently acquire the wrong
+    // relation type. So this checks the pairing survives both rebalancing and
+    // growth, not merely that relations can be stored.
+    std::cout << "Edge relations survive rebalance and growth\n";
+
+    std::mt19937 rng(4242);
+    const uint32_t V = 64;
+    PCSRGraph g(V, 64, 32 * 1024 * 1024); // tiny: forces growth
+
+    // The relation is derived from the edge itself, so any mismatch after a
+    // rebalance is detectable without keeping a side table.
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t, EdgeRelation>> inserted;
+    uint32_t ts = 1;
+    for (uint32_t k = 0; k < 12000; ++k) {
+        const uint32_t src = (k % 4 == 0) ? 0 : (rng() % V); // one hot vertex
+        const uint32_t dst = rng() % V;
+        const EdgeRelation relation = static_cast<EdgeRelation>((dst * 7 + 3) % 20 + 1);
+        g.insert_edge(src, dst, ts, relation);
+        inserted.push_back({src, dst, ts, relation});
+        ++ts;
+    }
+
+    check(g.get_resize_count() > 0, "relations test exercised growth");
+    check(g.get_rebalance_count() > 0, "relations test exercised rebalancing");
+
+    const uint32_t* offsets = g.get_vertex_offsets();
+    const uint32_t* counts = g.get_vertex_counts();
+    const TemporalEdge* edges = g.get_edges();
+    const EdgeRelation* relations = g.get_edge_relations();
+
+    uint64_t seen = 0;
+    bool paired = true;
+    bool nonzero = false;
+    for (uint32_t v = 0; v < V; ++v) {
+        for (uint32_t i = 0; i < counts[v]; ++i) {
+            const uint32_t slot = offsets[v] + i;
+            const EdgeRelation expected =
+                static_cast<EdgeRelation>((edges[slot].target_node * 7 + 3) % 20 + 1);
+            if (relations[slot] != expected) {
+                paired = false;
+            }
+            if (relations[slot] != RELATION_UNKNOWN) {
+                nonzero = true;
+            }
+            ++seen;
+        }
+    }
+    check(nonzero, "relations are actually populated");
+    check(paired, "every edge still carries its own relation after rebalancing");
+    check_eq(seen, inserted.size(), "no edge lost while carrying relations");
+    check_invariants(g, "relations");
+
+    // The default keeps existing callers working unchanged.
+    PCSRGraph plain(4, 32, 1024 * 1024);
+    plain.insert_edge(0, 1, 100);
+    check_eq(plain.get_edge_relations()[plain.get_vertex_offsets()[0]], RELATION_UNKNOWN,
+             "omitting the relation defaults to RELATION_UNKNOWN");
+}
+
 void test_boundaries() {
     std::cout << "Boundary conditions\n";
 
@@ -307,6 +369,7 @@ int main() {
     test_growth_beyond_capacity();
     test_all_edges_on_one_vertex();
     test_chronological_order_preserved();
+    test_edge_relations();
     test_boundaries();
     test_cache_alignment();
     test_arena_exhaustion();

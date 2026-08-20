@@ -1,6 +1,17 @@
-CXX = g++
-CXXFLAGS = -O3 -Wall -Wextra -std=c++20 -fPIC -march=native -I csrc/include
+CXX ?= g++
+ARCH_FLAGS ?= -march=native
+CXXFLAGS = -O3 -Wall -Wextra -std=c++20 -fPIC $(ARCH_FLAGS) -I csrc/include
+
+# -undefined dynamic_lookup is a macOS linker flag. On Linux it is not
+# recognised and the extension fails to link, so the platform is detected
+# rather than assumed. ARCH_FLAGS is overridable because -march=native is
+# unavailable on some cross-compiled and ARM CI runners.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
 LDFLAGS_EXT = -shared -undefined dynamic_lookup
+else
+LDFLAGS_EXT = -shared
+endif
 
 # Dynamically grab Python paths
 PYTHON = python3

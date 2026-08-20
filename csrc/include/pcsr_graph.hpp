@@ -42,14 +42,18 @@ class PCSRGraph {
         uint32_t* vertex_offsets;  // size = num_vertices + 1
         uint32_t* vertex_counts;   // size = num_vertices, live edges per vertex
         TemporalEdge* edges;       // size = edge_capacity
+        EdgeRelation* edge_relations;  // size = edge_capacity, parallel to edges
 
         TemporalEdge* scratchpad_edges;  // size = edge_capacity
+        EdgeRelation* scratchpad_relations;  // size = edge_capacity
         uint32_t* scratchpad_counts;     // size = num_vertices
         uint32_t* scratchpad_gaps;       // size = num_vertices
 
-        void rebalance_and_insert(uint32_t src, uint32_t dst, uint32_t timestamp);
+        void rebalance_and_insert(uint32_t src, uint32_t dst, uint32_t timestamp,
+                                  EdgeRelation relation);
         void redistribute(uint32_t v_start, uint32_t v_end,
-                          uint32_t src, uint32_t dst, uint32_t timestamp);
+                          uint32_t src, uint32_t dst, uint32_t timestamp,
+                          EdgeRelation relation);
         void resize_pma(uint32_t hot);
     public:
         /**
@@ -64,11 +68,13 @@ class PCSRGraph {
         PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity, size_t arena_bytes = 128 * 1024 * 1024);
         ~PCSRGraph();
 
-        void insert_edge(uint32_t src, uint32_t dst, uint32_t timestamp);
+        void insert_edge(uint32_t src, uint32_t dst, uint32_t timestamp,
+                         EdgeRelation relation = RELATION_UNKNOWN);
 
         const uint32_t* get_vertex_offsets() const { return vertex_offsets; }
         const uint32_t* get_vertex_counts() const { return vertex_counts; }
         const TemporalEdge* get_edges() const { return edges; }
+        const EdgeRelation* get_edge_relations() const { return edge_relations; }
         uint32_t get_num_vertices() const { return num_vertices; }
         uint32_t get_edge_capacity() const { return edge_capacity; }
         uint64_t get_num_edges() const { return num_edges; }

@@ -33,12 +33,14 @@ PYBIND11_MODULE(graph_engine, m) {
              py::arg("arena_bytes") = 128 * 1024 * 1024)
 
         .def("insert_edge", &PCSRGraph::insert_edge,
-             py::arg("src"), py::arg("dst"), py::arg("timestamp"))
+             py::arg("src"), py::arg("dst"), py::arg("timestamp"),
+             py::arg("relation") = RELATION_UNKNOWN)
 
         .def("insert_edges", [](PCSRGraph& self,
                                 py::array_t<uint32_t, py::array::c_style | py::array::forcecast> src,
                                 py::array_t<uint32_t, py::array::c_style | py::array::forcecast> dst,
-                                py::array_t<uint32_t, py::array::c_style | py::array::forcecast> ts) {
+                                py::array_t<uint32_t, py::array::c_style | py::array::forcecast> ts,
+                                py::object relations) {
             // Bulk path. Calling insert_edge() once per event costs a pybind
             // dispatch plus a Python int box per endpoint -- microseconds --
             // which swamps the ~15 ns the engine actually spends. Handing over
@@ -57,12 +59,26 @@ PYBIND11_MODULE(graph_engine, m) {
             const uint32_t* tp = ts.data();
             const size_t n = static_cast<size_t>(src.size());
 
+            const EdgeRelation* rp = nullptr;
+            py::array_t<EdgeRelation, py::array::c_style | py::array::forcecast> rel_array;
+            if (!relations.is_none()) {
+                rel_array = relations.cast<py::array_t<EdgeRelation,
+                                py::array::c_style | py::array::forcecast>>();
+                if (static_cast<size_t>(rel_array.size()) != n) {
+                    throw std::invalid_argument(
+                        "relation array must match the edge arrays in length");
+                }
+                rp = rel_array.data();
+            }
+
             py::gil_scoped_release release;
             for (size_t i = 0; i < n; ++i) {
-                self.insert_edge(sp[i], dp[i], tp[i]);
+                self.insert_edge(sp[i], dp[i], tp[i],
+                                 rp ? rp[i] : RELATION_UNKNOWN);
             }
             return n;
         }, py::arg("src"), py::arg("dst"), py::arg("timestamp"),
+           py::arg("relation") = py::none(),
            "Insert a whole batch from numpy arrays in one crossing, with the "
            "GIL released. Returns the number of edges inserted.")
 
@@ -77,6 +93,18 @@ PYBIND11_MODULE(graph_engine, m) {
                 py::cast(self)
             ));
         }, "Zero-copy view of the region boundaries (length V + 1).")
+
+        .def("get_edge_relations", [](PCSRGraph& self) {
+            EdgeRelation* data_ptr = const_cast<EdgeRelation*>(self.get_edge_relations());
+            uint32_t size = self.get_edge_capacity();
+
+            return as_readonly(py::array_t<EdgeRelation>(
+                {size},
+                {sizeof(EdgeRelation)},
+                data_ptr,
+                py::cast(self)
+            ));
+        }, "Zero-copy view of the per-slot relation type, parallel to get_edges().")
 
         .def("get_vertex_counts", [](PCSRGraph& self) {
             uint32_t* data_ptr = const_cast<uint32_t*>(self.get_vertex_counts());
@@ -135,6 +163,10 @@ PYBIND11_MODULE(graph_engine, m) {
             const uint32_t* counts = self.get_vertex_counts();
             const TemporalEdge* edges = self.get_edges();
 
+            py::array_t<EdgeRelation> rel(total);
+            auto* rp = rel.mutable_data();
+            const EdgeRelation* relations = self.get_edge_relations();
+
             size_t k = 0;
             for (uint32_t v = 0; v < self.get_num_vertices(); ++v) {
                 for (uint32_t i = 0; i < counts[v]; ++i) {
@@ -142,11 +174,12 @@ PYBIND11_MODULE(graph_engine, m) {
                     sp[k] = v;
                     dp[k] = e.target_node;
                     tp[k] = e.timestamp;
+                    rp[k] = relations[offsets[v] + i];
                     ++k;
                 }
             }
-            return py::make_tuple(src, dst, ts);
-        }, "Materialise the graph as (src, dst, timestamp) arrays for PyTorch "
+            return py::make_tuple(src, dst, ts, rel);
+        }, "Materialise the graph as (src, dst, timestamp, relation) arrays for PyTorch "
            "Geometric. This copies; the get_* views do not.")
 
         .def("get_degree", &PCSRGraph::get_degree, py::arg("vertex"))
@@ -166,4 +199,5 @@ PYBIND11_MODULE(graph_engine, m) {
         });
 
     m.attr("EMPTY_GAP") = EMPTY_GAP;
+    m.attr("RELATION_UNKNOWN") = RELATION_UNKNOWN;
 }
