@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The engine builds and passes its 64k assertions with no Python toolchain
+  # at all. Kept as a separate job so a broken ML dependency can never turn the
+  # C++ badge red.
+  cpp:
+    name: C++ core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        # -march=native is off: GitHub runners are heterogeneous and the flag
+        # is a performance choice, not a correctness one.
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DENABLE_NATIVE_ARCH=OFF
+          -DBUILD_PYTHON_MODULE=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run unit tests
+        run: ctest --test-dir build --output-on-failure
+
+  python:
+    name: Python (models, strategy, backtest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch: the default wheel pulls ~2 GB of CUDA that no
+          # runner here can use.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pybind11 numpy pandas networkx psutil pyarrow
+
+      - name: Build the extension
+        run: make ext ARCH_FLAGS=
+
+      - name: Model tests (time encoding, sampler, attention, causality)
+        run: python tests/test_tgat.py
+
+      - name: Strategy and backtest tests
+        run: python tests/test_strategy.py
+
+  lint:
+    name: Compile warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with warnings as errors
+        # The engine is small enough that -Werror is realistic, and a warning
+        # in memory-management code is worth failing a build over.
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -I csrc/include \
+              -c csrc/src/memory_arena.cpp csrc/src/pcsr_graph.cpp -o /dev/null 2>&1 || \
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -I csrc/include \
+              -fsyntax-only csrc/src/memory_arena.cpp csrc/src/pcsr_graph.cpp

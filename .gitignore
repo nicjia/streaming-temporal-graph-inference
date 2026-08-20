@@ -19,3 +19,8 @@ cmake-build-*/
 # IDEs
 .idea/
 .vscode/
+
+# Downloaded data (GDELT slices, price history, caches, entity maps)
+data/
+results/
+results_fx/
