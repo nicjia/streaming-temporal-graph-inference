@@ -95,6 +95,37 @@ def model_signal(model, sampler, countries, country_ids, dates, cutoff_hour=0,
     return pd.DataFrame(rows, columns=["date", "country", "signal"])
 
 
+def intensity_signal(model, countries, country_ids, dates, cutoff_hour=0,
+                     batch_size=512):
+    """
+    Per-country predicted conflict rate from a TGATIntensityModel.
+
+    Unlike `model_signal`, this is the model's direct forecast of the quantity
+    the strategy cares about rather than an aggregate of ranking scores, so the
+    values are comparable across countries by construction.
+    """
+    node_ids, timestamps, index = [], [], []
+    for date in dates:
+        cutoff = cutoff_timestamp(date, cutoff_hour)
+        for country, node_id in zip(countries, country_ids):
+            node_ids.append(node_id)
+            timestamps.append(cutoff)
+            index.append((pd.Timestamp(date).date().isoformat(), country))
+
+    node_ids = np.asarray(node_ids, dtype=np.int64)
+    timestamps = np.asarray(timestamps, dtype=np.int64)
+
+    predictions = []
+    for start in range(0, len(node_ids), batch_size):
+        stop = start + batch_size
+        predictions.append(model.predict(node_ids[start:stop], timestamps[start:stop]))
+    predictions = np.concatenate(predictions) if predictions else np.array([])
+
+    frame = pd.DataFrame(index, columns=["date", "country"])
+    frame["signal"] = predictions
+    return frame
+
+
 # ---------------------------------------------------------------------------
 # Baselines. A model signal that cannot beat these is not earning its keep.
 # ---------------------------------------------------------------------------
@@ -186,3 +217,37 @@ def random_signal(countries, dates, seed=0):
             rows.append((pd.Timestamp(date).date().isoformat(), country,
                          float(rng.normal())))
     return pd.DataFrame(rows, columns=["date", "country", "signal"])
+
+
+def reversal_signal(prices, universe, countries, dates, lookback_days=1):
+    """
+    One-day cross-sectional reversal, using prices only.
+
+    The control every equity signal owes the reader. Short-term reversal is a
+    well-documented effect that needs no model, no graph and no event data, so
+    a geopolitical signal that cannot beat it has not demonstrated that the
+    geopolitics mattered. Sign convention: yesterday's losers are expected to
+    outperform, so the signal is the negated trailing return and it is traded
+    long.
+    """
+    frame = prices.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    wide = frame.pivot_table(index="date", columns="ticker", values="close",
+                             aggfunc="last").sort_index()
+
+    tickers = {c: universe.ticker(c) for c in countries}
+    tickers = {c: t for c, t in tickers.items() if t is not None and t in wide.columns}
+    if not tickers:
+        return pd.DataFrame(columns=["date", "country", "signal"])
+
+    usable = [c for c in countries if c in tickers]
+    panel = wide[[tickers[c] for c in usable]]
+    panel.columns = usable
+
+    trailing = panel.pct_change(lookback_days, fill_method=None)
+    signal = (-trailing).reindex(pd.DatetimeIndex(dates).normalize())
+
+    long_frame = signal.stack(future_stack=True).reset_index()
+    long_frame.columns = ["date", "country", "signal"]
+    long_frame["date"] = pd.to_datetime(long_frame["date"]).dt.date.astype(str)
+    return long_frame.dropna(subset=["signal"])

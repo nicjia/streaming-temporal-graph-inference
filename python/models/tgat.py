@@ -43,7 +43,8 @@ class TemporalAttentionLayer(nn.Module):
         dropout: Applied to attention weights and to the output projection.
     """
 
-    def __init__(self, node_dim, time_dim, out_dim, num_heads=2, dropout=0.1):
+    def __init__(self, node_dim, time_dim, out_dim, num_heads=2, dropout=0.1,
+                 relation_dim=0):
         super().__init__()
         if out_dim % num_heads != 0:
             raise ValueError(f"out_dim ({out_dim}) must be divisible by "
@@ -58,8 +59,15 @@ class TemporalAttentionLayer(nn.Module):
         # and softmax saturates into a near-one-hot, killing the gradient.
         self.scale = self.head_dim ** -0.5
 
+        # The relation encoding joins the key and value but not the query: the
+        # query is the target node asking "what happened to me", which has no
+        # relation of its own. Putting it in the key is what lets the attention
+        # logit depend on the *kind* of interaction as well as who and when --
+        # a sanction and a summit between the same pair at the same lag can now
+        # receive different weight, which the model previously could not express.
+        self.relation_dim = relation_dim
         query_dim = node_dim + time_dim
-        key_dim = node_dim + time_dim
+        key_dim = node_dim + time_dim + relation_dim
 
         self.q_proj = nn.Linear(query_dim, out_dim, bias=False)
         self.k_proj = nn.Linear(key_dim, out_dim, bias=False)
@@ -82,7 +90,8 @@ class TemporalAttentionLayer(nn.Module):
         self.residual = (nn.Identity() if node_dim == out_dim
                          else nn.Linear(node_dim, out_dim, bias=False))
 
-    def forward(self, target_h, target_time_enc, neighbor_h, neighbor_time_enc, mask):
+    def forward(self, target_h, target_time_enc, neighbor_h, neighbor_time_enc, mask,
+                neighbor_relation_enc=None):
         """
         Args:
             target_h: (B, node_dim) representation of each query node.
@@ -97,7 +106,13 @@ class TemporalAttentionLayer(nn.Module):
         batch, num_neighbors, _ = neighbor_h.shape
 
         query_in = torch.cat([target_h, target_time_enc], dim=-1)
-        kv_in = torch.cat([neighbor_h, neighbor_time_enc], dim=-1)
+        kv_parts = [neighbor_h, neighbor_time_enc]
+        if self.relation_dim:
+            if neighbor_relation_enc is None:
+                raise ValueError("layer was built with relation_dim > 0 but no "
+                                 "relation encoding was supplied")
+            kv_parts.append(neighbor_relation_enc)
+        kv_in = torch.cat(kv_parts, dim=-1)
 
         # (B, H, 1, dh) and (B, H, K, dh)
         q = self.q_proj(query_in).view(batch, self.num_heads, 1, self.head_dim)
@@ -157,7 +172,7 @@ class TGAT(nn.Module):
 
     def __init__(self, num_nodes, sampler, node_dim=64, time_dim=64, num_layers=2,
                  num_neighbors=20, num_heads=2, dropout=0.1, strategy="recent",
-                 node_features=None):
+                 node_features=None, num_relations=0, relation_dim=16):
         super().__init__()
         self.num_nodes = num_nodes
         self.sampler = sampler
@@ -181,8 +196,20 @@ class TGAT(nn.Module):
         # just split the gradient signal.
         self.time_encoder = TimeEncode(time_dim)
 
+        # Relation types are a small unordered vocabulary (GDELT's 20 event root
+        # codes, or 4 quad classes), so a learned embedding table -- not a
+        # one-hot, and certainly not the integer code as a scalar, which would
+        # assert that code 7 sits between 6 and 8.
+        self.num_relations = num_relations
+        self.relation_dim = relation_dim if num_relations else 0
+        self.relation_embedding = (nn.Embedding(num_relations, relation_dim)
+                                   if num_relations else None)
+        if self.relation_embedding is not None:
+            nn.init.normal_(self.relation_embedding.weight, std=0.1)
+
         self.layers = nn.ModuleList([
-            TemporalAttentionLayer(node_dim, time_dim, node_dim, num_heads, dropout)
+            TemporalAttentionLayer(node_dim, time_dim, node_dim, num_heads, dropout,
+                                   relation_dim=self.relation_dim)
             for _ in range(num_layers)
         ])
 
@@ -212,11 +239,17 @@ class TGAT(nn.Module):
         if depth == 0:
             return h
 
-        neighbor_ids, neighbor_times, mask = self.sampler.sample(
+        sampled = self.sampler.sample(
             nodes, times, self.num_neighbors,
             strategy=self.strategy,
             rng=self._rng if self.strategy == "uniform" else None,
+            with_relations=self.num_relations > 0,
         )
+        if self.num_relations:
+            neighbor_ids, neighbor_times, mask, neighbor_relations = sampled
+        else:
+            neighbor_ids, neighbor_times, mask = sampled
+            neighbor_relations = None
 
         batch = nodes.shape[0]
         flat_ids = neighbor_ids.reshape(-1).astype(np.int64)
@@ -240,8 +273,15 @@ class TGAT(nn.Module):
         target_time_enc = self.time_encoder(
             torch.zeros(batch, dtype=torch.float32, device=self.device))
 
+        relation_enc = None
+        if self.num_relations:
+            codes = np.clip(neighbor_relations.astype(np.int64), 0,
+                            self.num_relations - 1)
+            relation_enc = self.relation_embedding(
+                torch.as_tensor(codes, dtype=torch.long, device=self.device))
+
         return self.layers[depth - 1](h, target_time_enc, neighbor_h,
-                                      neighbor_time_enc, mask_tensor)
+                                      neighbor_time_enc, mask_tensor, relation_enc)
 
 
 class LinkPredictor(nn.Module):

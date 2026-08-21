@@ -6,13 +6,15 @@ from .signals import (
     cutoff_timestamp,
     pairwise_pressure,
     model_signal,
+    intensity_signal,
     goldstein_signal,
     event_count_signal,
     random_signal,
+    reversal_signal,
 )
 
 __all__ = [
     "Universe", "COUNTRY_TO_ETF", "COUNTRY_NAMES", "THEMATIC",
-    "signal_dates", "cutoff_timestamp", "pairwise_pressure", "model_signal",
-    "goldstein_signal", "event_count_signal", "random_signal",
+    "signal_dates", "cutoff_timestamp", "pairwise_pressure", "model_signal", "intensity_signal",
+    "goldstein_signal", "event_count_signal", "random_signal", "reversal_signal",
 ]

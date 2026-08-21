@@ -59,6 +59,7 @@ class PCSRTemporalSampler:
         edges = np.asarray(self.graph.get_edges())
         self.edge_targets = edges[:, 0]
         self.edge_times = edges[:, 1]
+        self.edge_relations = np.asarray(self.graph.get_edge_relations())
         self.num_vertices = int(self.graph.num_vertices)
 
     def validate(self):
@@ -104,7 +105,75 @@ class PCSRTemporalSampler:
 
         return starts, lo
 
-    def sample(self, nodes, times, num_neighbors, strategy="recent", rng=None):
+    def recency_features(self, nodes, times, num_neighbors):
+        """
+        Scalar rate features for each (node, time) query.
+
+        These exist because the attention layer cannot produce them. Attention
+        pools its neighbourhood with softmax weights, which is a weighted
+        *average*; a mean aggregator cannot distinguish two histories that
+        differ only in how many events they contain, and the LayerNorm on the
+        layer output removes what little magnitude survives. So a TGAT
+        embedding can tell you who a country interacts with and cannot tell you
+        how often -- measured at 99.6% static variance when asked for a rate.
+
+        The information is right there in the PMA: the cut index gives the size
+        of the admissible history, and the timestamps around it give the recent
+        arrival rate. Computing it here and concatenating it to the embedding
+        costs one extra bisection and lets the head see cardinality.
+
+        All four are expressed in *day* units and scaled to be O(1). That is
+        not cosmetic. The first version returned log-seconds, so the head was
+        fed values around 8 to 12 with small variation on top; a two-layer MLP
+        given inputs like that trains badly, and it converged to a fit whose
+        output correlated -0.51 with the target it was trained on -- inverted,
+        while still matching the mean. The features themselves were correct
+        throughout (log rate alone correlates +0.58 with future counts). Scale
+        is the whole difference.
+
+        Returns:
+            (B, 4) float32: scaled history size, log1p(days since the most
+            recent event), log1p(days spanned by the last K events), and the
+            log arrival rate in events per day over that span.
+        """
+        seconds_per_day = 86400.0
+        nodes = np.asarray(nodes, dtype=np.int64)
+        times = np.asarray(times, dtype=np.int64)
+
+        starts, cuts = self._cut_indices(nodes, times)
+        available = cuts - starts
+        has_history = available > 0
+
+        # Index of the most recent admissible event, and of the K-th most
+        # recent, both clamped into the node's own region.
+        last_index = np.clip(cuts - 1, starts, None)
+        kth_index = np.maximum(starts, cuts - num_neighbors)
+
+        last_time = self.edge_times[np.clip(last_index, 0, self.edge_times.size - 1)]
+        kth_time = self.edge_times[np.clip(kth_index, 0, self.edge_times.size - 1)]
+
+        # No history: report a maximally stale, zero-rate state rather than a
+        # negative or undefined one.
+        stale = np.float64(10 ** 7)  # ~116 days
+        since_last = np.where(has_history, times - last_time, stale).astype(np.float64)
+        span = np.where(has_history, times - kth_time, stale).astype(np.float64)
+
+        since_last_days = np.maximum(since_last, 0.0) / seconds_per_day
+        span_days = np.maximum(span / seconds_per_day, 1.0 / 24.0)
+
+        counted = np.minimum(available, num_neighbors).astype(np.float64)
+        rate_per_day = np.log((counted + 1.0) / span_days)
+
+        features = np.stack([
+            np.log1p(available.astype(np.float64)) / 5.0,
+            np.log1p(since_last_days),
+            np.log1p(span_days),
+            rate_per_day,
+        ], axis=1)
+        return features.astype(np.float32)
+
+    def sample(self, nodes, times, num_neighbors, strategy="recent", rng=None,
+               with_relations=False):
         """
         Args:
             nodes: (B,) vertex ids.
@@ -118,6 +187,9 @@ class PCSRTemporalSampler:
             neighbor_ids: (B, K) uint32, zero where masked.
             neighbor_times: (B, K) int64, zero where masked.
             mask: (B, K) bool, True where the slot holds a real neighbour.
+            neighbor_relations: (B, K) uint16, zero where masked. Only returned
+                when `with_relations` is set, so existing two-hop callers keep
+                their three-tuple.
 
         Nodes with no admissible history come back fully masked rather than
         dropped, so the batch keeps a fixed shape and the attention layer can
@@ -158,4 +230,8 @@ class PCSRTemporalSampler:
         neighbor_ids = np.where(mask, self.edge_targets[safe], 0).astype(np.uint32)
         neighbor_times = np.where(mask, self.edge_times[safe], 0).astype(np.int64)
 
-        return neighbor_ids, neighbor_times, mask
+        if not with_relations:
+            return neighbor_ids, neighbor_times, mask
+
+        neighbor_relations = np.where(mask, self.edge_relations[safe], 0).astype(np.uint16)
+        return neighbor_ids, neighbor_times, mask, neighbor_relations

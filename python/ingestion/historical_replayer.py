@@ -55,7 +55,7 @@ class DataReplayer:
         return cls(num_nodes, capacity, arena)
 
     def replay_events(self, src_names, dst_names, timestamps, mapper=None,
-                      quiet=False):
+                      quiet=False, relations=None):
         """
         Map entity strings to ids and stream the events into the engine.
 
@@ -79,6 +79,8 @@ class DataReplayer:
             dst_ids = mapper.get_ids(dst_names)
 
         timestamps = np.asarray(timestamps, dtype=np.int64)
+        if relations is not None:
+            relations = np.asarray(relations, dtype=np.uint16)
 
         # -1 marks a blank name or an entity past the mapper's cap. Ids at or
         # beyond the vertex count would raise out_of_range inside the engine.
@@ -89,6 +91,8 @@ class DataReplayer:
         src_ids = src_ids[keep]
         dst_ids = dst_ids[keep]
         timestamps = timestamps[keep]
+        if relations is not None:
+            relations = relations[keep]
 
         # Chronological order is not cosmetic: the temporal sampler binary-
         # searches each adjacency run, which is only valid if runs are sorted,
@@ -98,9 +102,11 @@ class DataReplayer:
         src_ids = src_ids[order].astype(np.uint32)
         dst_ids = dst_ids[order].astype(np.uint32)
         timestamps = timestamps[order].astype(np.uint32)
+        if relations is not None:
+            relations = relations[order]
 
         start = time.perf_counter()
-        self.graph.insert_edges(src_ids, dst_ids, timestamps)
+        self.graph.insert_edges(src_ids, dst_ids, timestamps, relations)
         elapsed = time.perf_counter() - start
 
         stats = {

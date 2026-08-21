@@ -24,8 +24,42 @@ QUAD_MATERIAL_CONFLICT = 4
 CONFLICT_CLASSES = (QUAD_VERBAL_CONFLICT, QUAD_MATERIAL_CONFLICT)
 COOPERATION_CLASSES = (QUAD_VERBAL_COOP, QUAD_MATERIAL_COOP)
 
-CORPUS_COLUMNS = ["ts", "src", "dst", "quad_class", "goldstein", "tone",
-                  "num_mentions", "src_country", "dst_country"]
+# src_country / dst_country were dropped: at country granularity they are exact
+# duplicates of src / dst, and nothing downstream ever read them. Two redundant
+# categorical columns is ~10 bytes a row, which is gigabytes across five years.
+CORPUS_COLUMNS = ["ts", "src", "dst", "quad_class", "event_root_code", "goldstein",
+                  "tone", "num_mentions"]
+
+
+def _read_cache(path):
+    """Read a cached corpus, dispatching on extension."""
+    if path.endswith(".parquet"):
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
+
+
+def _write_cache(table, path):
+    """
+    Write the corpus cache.
+
+    Parquet is preferred when the extension asks for it, but it needs pyarrow
+    or fastparquet, which are not in requirements.txt -- so a missing engine
+    falls back to gzipped CSV beside it rather than taking down a pipeline run
+    over a cache write.
+    """
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    if path.endswith(".parquet"):
+        try:
+            table.to_parquet(path, index=False)
+            return path
+        except ImportError:
+            path = path[: -len(".parquet")] + ".csv.gz"
+
+    table.to_csv(path, index=False)
+    return path
 
 
 def _resolve_country(codes, names):
@@ -51,8 +85,57 @@ def _resolve_country(codes, names):
     return resolved
 
 
+def _reduce(raw, entity_level):
+    """Turn a raw GDELT frame into the compact corpus schema."""
+    table = pd.DataFrame(index=raw.index)
+    table["ts"] = to_unix_seconds(raw["DATEADDED"])
+
+    src_country = _resolve_country(raw.get("Actor1CountryCode"), raw["Actor1Name"])
+    dst_country = _resolve_country(raw.get("Actor2CountryCode"), raw["Actor2Name"])
+
+    if entity_level == "country":
+        table["src"] = src_country
+        table["dst"] = dst_country
+    elif entity_level == "actor":
+        table["src"] = raw["Actor1Name"].astype(str).str.strip().str.upper()
+        table["dst"] = raw["Actor2Name"].astype(str).str.strip().str.upper()
+    else:
+        raise ValueError(f"entity_level must be 'country' or 'actor', got {entity_level!r}")
+
+    table["quad_class"] = pd.to_numeric(raw.get("QuadClass"), errors="coerce")
+    # CAMEO event root code 1-20, ordered roughly by escalation.
+    table["event_root_code"] = pd.to_numeric(raw.get("EventRootCode"), errors="coerce")
+    table["goldstein"] = pd.to_numeric(raw.get("GoldsteinScale"), errors="coerce")
+    table["tone"] = pd.to_numeric(raw.get("AvgTone"), errors="coerce")
+    table["num_mentions"] = pd.to_numeric(raw.get("NumMentions"), errors="coerce").fillna(1)
+
+    before = len(table)
+    table = table.dropna(subset=["ts", "src", "dst"])
+    table = table[table["src"] != table["dst"]]  # self-loops carry no relation
+
+    table = table[CORPUS_COLUMNS]
+
+    # Narrow dtypes. Across five years (~44M rows) the difference between the
+    # obvious types and these is roughly 2 GB of resident memory, which decides
+    # whether the corpus loads at all on a 16 GB machine.
+    #   ts               int32   -- unix seconds, good to 2038
+    #   src / dst        category -- ~220 distinct countries, one byte a code
+    #   quad_class       uint8   -- 1..4, 0 means unknown
+    #   event_root_code  uint8   -- 1..20, 0 means unknown (== RELATION_UNKNOWN)
+    table["ts"] = table["ts"].astype("int32")
+    for column in ("src", "dst"):
+        table[column] = table[column].astype("category")
+    for column in ("quad_class", "event_root_code"):
+        table[column] = table[column].fillna(0).clip(0, 255).astype("uint8")
+    for column in ("goldstein", "tone", "num_mentions"):
+        table[column] = table[column].astype("float32")
+
+    return table, before - len(table)
+
+
 def load_corpus(pattern="data/gdelt/*.csv", entity_level="country",
-                cache=None, rebuild=False, quiet=False):
+                cache=None, rebuild=False, quiet=False, batch_size=500,
+                progress_every=4):
     """
     Build (or load) the consolidated event table.
 
@@ -70,13 +153,19 @@ def load_corpus(pattern="data/gdelt/*.csv", entity_level="country",
     Returns:
         DataFrame with CORPUS_COLUMNS, sorted by ts.
     """
-    if cache and os.path.exists(cache) and not rebuild:
-        table = pd.read_parquet(cache)
-        if not quiet:
-            print(f"Loaded {len(table):,} events from cache {cache}")
-        return table
+    if cache and not rebuild:
+        for candidate in (cache, cache.replace(".parquet", ".csv.gz")):
+            if os.path.exists(candidate):
+                table = _read_cache(candidate)
+                if not quiet:
+                    print(f"Loaded {len(table):,} events from cache {candidate}")
+                return table
 
     paths = sorted(glob.glob(pattern))
+    if pattern.endswith(".csv"):
+        # Slices are stored gzipped; accept both so a plain-.csv glob still
+        # finds everything.
+        paths = sorted(set(paths) | set(glob.glob(pattern + ".gz")))
     if not paths:
         raise FileNotFoundError(
             f"No GDELT slices matched {pattern!r}. Download some first:\n"
@@ -85,60 +174,60 @@ def load_corpus(pattern="data/gdelt/*.csv", entity_level="country",
     if not quiet:
         print(f"Reading {len(paths)} GDELT slice(s)...")
 
-    frames = []
-    for path in paths:
-        frame = pd.read_csv(path, low_memory=False)
-        if "Actor1Name" not in frame.columns:
+    # Processed in batches rather than concatenated raw. A year of 15-minute
+    # slices is ~44M rows across 16 mostly-string columns; holding all of that
+    # in pandas before reducing it needs tens of gigabytes, while the reduced
+    # form is ~10M rows of nine narrow columns. Reduce first, accumulate second.
+    chunks = []
+    dropped = 0
+    read = 0
+
+    for batch_start in range(0, len(paths), batch_size):
+        frames = []
+        for path in paths[batch_start:batch_start + batch_size]:
+            frame = pd.read_csv(path, low_memory=False)
+            if "Actor1Name" in frame.columns:
+                frames.append(frame)
+        if not frames:
             continue
-        frames.append(frame)
 
-    raw = pd.concat(frames, ignore_index=True)
-    raw = raw.dropna(subset=["Actor1Name", "Actor2Name", "DATEADDED"])
+        raw = pd.concat(frames, ignore_index=True)
+        del frames
+        raw = raw.dropna(subset=["Actor1Name", "Actor2Name", "DATEADDED"])
+        read += len(raw)
 
-    table = pd.DataFrame(index=raw.index)
-    table["ts"] = to_unix_seconds(raw["DATEADDED"])
+        reduced, lost = _reduce(raw, entity_level)
+        dropped += lost
+        chunks.append(reduced)
+        del raw
 
-    src_country = _resolve_country(raw.get("Actor1CountryCode"), raw["Actor1Name"])
-    dst_country = _resolve_country(raw.get("Actor2CountryCode"), raw["Actor2Name"])
-    table["src_country"] = src_country
-    table["dst_country"] = dst_country
+        if not quiet and progress_every and \
+                (batch_start // batch_size) % progress_every == 0:
+            done = min(batch_start + batch_size, len(paths))
+            kept = sum(len(c) for c in chunks)
+            print(f"  {done}/{len(paths)} slices, {kept:,} events kept", flush=True)
 
-    if entity_level == "country":
-        table["src"] = src_country
-        table["dst"] = dst_country
-    elif entity_level == "actor":
-        table["src"] = raw["Actor1Name"].astype(str).str.strip().str.upper()
-        table["dst"] = raw["Actor2Name"].astype(str).str.strip().str.upper()
-    else:
-        raise ValueError(f"entity_level must be 'country' or 'actor', got {entity_level!r}")
+    if not chunks:
+        raise ValueError("no usable rows found in the matched slices")
 
-    table["quad_class"] = pd.to_numeric(raw.get("QuadClass"), errors="coerce")
-    table["goldstein"] = pd.to_numeric(raw.get("GoldsteinScale"), errors="coerce")
-    table["tone"] = pd.to_numeric(raw.get("AvgTone"), errors="coerce")
-    table["num_mentions"] = pd.to_numeric(raw.get("NumMentions"), errors="coerce").fillna(1)
+    table = pd.concat(chunks, ignore_index=True)
+    del chunks
 
-    before = len(table)
-    table = table.dropna(subset=["ts", "src", "dst"])
-    table = table[table["src"] != table["dst"]]  # self-loops carry no relation
-
-    table = table[CORPUS_COLUMNS].sort_values("ts", kind="stable").reset_index(drop=True)
-    table["ts"] = table["ts"].astype("int64")
+    table = table.sort_values("ts", kind="stable").reset_index(drop=True)
+    table["ts"] = table["ts"].astype("int64")  # widen back for arithmetic
 
     if not quiet:
         span = pd.to_datetime(table["ts"], unit="s")
-        print(f"Corpus: {len(table):,} events ({before - len(table):,} dropped as "
+        print(f"Corpus: {len(table):,} events ({dropped:,} dropped as "
               f"unresolvable or self-referential)")
         if len(table):
             print(f"  span {span.min()} -> {span.max()}, "
                   f"{table['src'].nunique():,} distinct sources")
 
     if cache:
-        directory = os.path.dirname(cache)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        table.to_parquet(cache, index=False)
+        written = _write_cache(table, cache)
         if not quiet:
-            print(f"  cached to {cache}")
+            print(f"  cached to {written}")
 
     return table
 
@@ -228,10 +317,10 @@ def synthetic_corpus(num_days=180, countries=None, seed=0, events_per_day=400,
             rows.append((
                 int(base + rng.integers(0, 86400)),
                 countries[source], countries[target], int(quad),
+                int(rng.integers(14, 21) if is_conflict else rng.integers(1, 6)),
                 float(rng.normal(-5 if is_conflict else 4, 2)),
                 float(rng.normal(-3 if is_conflict else 2, 3)),
                 float(rng.integers(1, 20)),
-                countries[source], countries[target],
             ))
 
     events = pd.DataFrame(rows, columns=CORPUS_COLUMNS)

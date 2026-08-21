@@ -82,6 +82,10 @@ def load_gdelt_workload(pattern, repeat=1):
     import pandas as pd
 
     paths = sorted(glob.glob(pattern))
+    if pattern.endswith(".csv"):
+        # Slices are stored gzipped; accept both so a plain-.csv glob still
+        # finds everything.
+        paths = sorted(set(paths) | set(glob.glob(pattern + ".gz")))
     if not paths:
         raise SystemExit(f"No GDELT CSVs matched {pattern!r}")
 

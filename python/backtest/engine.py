@@ -37,6 +37,16 @@ class BacktestConfig:
         gross_exposure: Sum of absolute weights each day.
         min_names: Days with fewer tradable names than this are skipped rather
             than traded at concentrated weights.
+        timeseries_window: Trailing window, in days, used to demean each
+            country's own signal before the cross-sectional step. 0 disables it.
+            This is not cosmetic: the first model signal this project produced
+            had 98% of its variance in a constant per-country offset, so the
+            cross-sectional ranking was a fixed bet on country identity dressed
+            up as a timing signal. Subtracting each country's own trailing mean
+            isolates the part that actually moves. The window is strictly
+            trailing, so it introduces no lookahead.
+        timeseries_min_periods: Observations needed before the trailing mean is
+            used, so the book starts trading before the full window fills.
     """
     direction: int = -1
     execution_lag_days: int = 1
@@ -44,6 +54,8 @@ class BacktestConfig:
     max_weight: float = 0.15
     gross_exposure: float = 1.0
     min_names: int = 5
+    timeseries_window: int = 60
+    timeseries_min_periods: int = 10
     metadata: dict = field(default_factory=dict)
 
 
@@ -68,29 +80,50 @@ def build_weights(signal_frame, config):
     """
     Turn a date x country signal panel into a dollar-neutral weight panel.
 
-    Standardisation is strictly cross-sectional: each day's signals are
+    Two normalisations, in order.
+
+    First, optionally, each country's signal is demeaned against its own
+    trailing history (see BacktestConfig.timeseries_window) to strip out any
+    persistent level and leave the part that moves.
+
+    Second, standardisation across the cross-section: each day's signals are
     demeaned and scaled by that same day's dispersion. Using a full-sample mean
     and standard deviation is the classic silent lookahead in a panel backtest
     -- it leaks the future distribution into every past day.
     """
+    if config.timeseries_window and config.timeseries_window > 1:
+        trailing = (signal_frame
+                    .rolling(config.timeseries_window,
+                             min_periods=config.timeseries_min_periods)
+                    .mean()
+                    .shift(1))
+        signal_frame = (signal_frame - trailing).where(trailing.notna())
+
     centred = signal_frame.sub(signal_frame.mean(axis=1), axis=0)
     dispersion = signal_frame.std(axis=1, ddof=0).replace(0.0, np.nan)
     z = centred.div(dispersion, axis=0)
 
     weights = config.direction * z
-    weights = weights.clip(-3.0, 3.0)
+    weights = weights.clip(-3.0, 3.0)  # winsorise outliers before sizing
 
-    # Normalise so gross exposure is constant, then cap per name and
-    # renormalise. Capping changes the gross, so the order matters.
-    gross = weights.abs().sum(axis=1).replace(0.0, np.nan)
-    weights = weights.div(gross, axis=0) * config.gross_exposure
-    weights = weights.clip(-config.max_weight, config.max_weight)
-
-    gross = weights.abs().sum(axis=1).replace(0.0, np.nan)
-    weights = weights.div(gross, axis=0) * config.gross_exposure
-
-    # Re-neutralise: capping can leave a small net long or short.
+    # Three steps, in an order that makes both constraints exact.
+    #
+    # Demean first, so the book is dollar-neutral. Then scale to the target
+    # gross. Then enforce the per-name cap by scaling the whole row down rather
+    # than clipping the offending names: clipping breaks neutrality and forces
+    # a renormalise, which pushes names back over the cap -- the two operations
+    # fight and neither constraint ends up holding. Multiplying a zero-mean row
+    # by a scalar leaves it zero-mean, so a single pass satisfies both. The
+    # price is that a concentrated day runs below the target gross, which is
+    # the right way round: under-risked beats over-concentrated.
     weights = weights.sub(weights.mean(axis=1), axis=0)
+
+    gross = weights.abs().sum(axis=1).replace(0.0, np.nan)
+    weights = weights.div(gross, axis=0) * config.gross_exposure
+
+    largest = weights.abs().max(axis=1).replace(0.0, np.nan)
+    shrink = (config.max_weight / largest).clip(upper=1.0)
+    weights = weights.mul(shrink, axis=0)
 
     tradable = signal_frame.notna().sum(axis=1)
     weights[tradable < config.min_names] = np.nan
@@ -124,6 +157,12 @@ def run_backtest(signals, prices, universe, config=None):
     signal_frame = _to_wide_signals(signals)
     price_frame = _to_wide_prices(prices)
 
+    # Invert quote conventions before anything else touches the prices, so
+    # returns, labels and weights all speak the same direction.
+    inverted = getattr(universe, "invert", set())
+    for ticker in inverted & set(price_frame.columns):
+        price_frame[ticker] = 1.0 / price_frame[ticker]
+
     # Map countries onto instruments and drop anything untradable.
     columns = {country: universe.ticker(country) for country in signal_frame.columns}
     columns = {country: ticker for country, ticker in columns.items()
@@ -132,6 +171,13 @@ def run_backtest(signals, prices, universe, config=None):
         raise ValueError("no signal country maps to a ticker present in the price data")
 
     signal_frame = signal_frame[list(columns)].rename(columns=columns)
+
+    # Several countries can share one instrument (the euro bloc, for example).
+    # Average their signals rather than opening the same position repeatedly --
+    # duplicate columns would otherwise silently multiply that instrument's
+    # weight by the number of countries pointing at it.
+    if signal_frame.columns.duplicated().any():
+        signal_frame = signal_frame.T.groupby(level=0).mean().T
 
     # Trade only on days the market was open, and only on names with a price.
     calendar = price_frame.index
@@ -177,6 +223,18 @@ def summarise(daily):
 
     years = len(net) / TRADING_DAYS
     total = float(equity.iloc[-1] - 1.0)
+
+    # A book can lose more than everything on paper when daily returns compound
+    # below -100%. Raising a negative base to a fractional power is complex, so
+    # the CAGR is pinned at total loss rather than crashing -- and a result that
+    # trips this is telling you the position sizing is broken, not that you
+    # found a strategy.
+    if total <= -1.0:
+        annual_return = -1.0
+    elif years > 0:
+        annual_return = float((1.0 + total) ** (1.0 / years) - 1.0)
+    else:
+        annual_return = float("nan")
     volatility = float(net.std(ddof=1) * np.sqrt(TRADING_DAYS))
     mean_daily = float(net.mean())
 
@@ -189,7 +247,7 @@ def summarise(daily):
     return {
         "days": int(len(net)),
         "total_return": total,
-        "annual_return": float((1.0 + total) ** (1 / years) - 1.0) if years > 0 else float("nan"),
+        "annual_return": annual_return,
         "annual_volatility": volatility,
         "sharpe": float(mean_daily / net.std(ddof=1) * np.sqrt(TRADING_DAYS))
                   if net.std(ddof=1) > 0 else float("nan"),
