@@ -1,6 +1,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include "../include/pcsr_graph.hpp"
+#include "../include/streaming_ingestor.hpp"
 
 namespace py = pybind11;
 
@@ -32,9 +33,14 @@ PYBIND11_MODULE(graph_engine, m) {
              py::arg("initial_edge_capacity"),
              py::arg("arena_bytes") = 128 * 1024 * 1024)
 
-        .def("insert_edge", &PCSRGraph::insert_edge,
-             py::arg("src"), py::arg("dst"), py::arg("timestamp"),
-             py::arg("relation") = RELATION_UNKNOWN)
+        .def("insert_edge", [](PCSRGraph& self, uint32_t src, uint32_t dst,
+                               uint32_t timestamp, EdgeRelation relation) {
+            // Guarded too: the scalar path holds the GIL, but a bulk insert on
+            // another thread has released it, so the two can still overlap.
+            PCSRGraph::WriteGuard guard(self);
+            self.insert_edge(src, dst, timestamp, relation);
+        }, py::arg("src"), py::arg("dst"), py::arg("timestamp"),
+           py::arg("relation") = RELATION_UNKNOWN)
 
         .def("insert_edges", [](PCSRGraph& self,
                                 py::array_t<uint32_t, py::array::c_style | py::array::forcecast> src,
@@ -70,6 +76,11 @@ PYBIND11_MODULE(graph_engine, m) {
                 }
                 rp = rel_array.data();
             }
+
+            // Acquired before the GIL is dropped, so a rejection surfaces as
+            // a normal Python exception rather than unwinding through a
+            // GIL-released region.
+            PCSRGraph::WriteGuard guard(self);
 
             py::gil_scoped_release release;
             for (size_t i = 0; i < n; ++i) {
@@ -197,6 +208,83 @@ PYBIND11_MODULE(graph_engine, m) {
                    " edges=" + std::to_string(self.get_num_edges()) +
                    " capacity=" + std::to_string(self.get_edge_capacity()) + ">";
         });
+
+    // ---- streaming ingestion over the lock-free queue ----------------------
+    py::class_<StreamingIngestor>(m, "StreamingIngestor")
+        .def(py::init([](PCSRGraph& graph, size_t queue_capacity) {
+            return new StreamingIngestor(graph, queue_capacity);
+        }), py::arg("graph"), py::arg("queue_capacity") = 65536,
+            py::keep_alive<1, 2>(),  // the ingestor holds a reference to the graph
+            "Streams events into a graph across a lock-free SPSC queue, with a "
+            "dedicated C++ consumer thread. Lets a Python producer decode the "
+            "next chunk while the previous one is still being inserted.")
+
+        .def("start", [](StreamingIngestor& self) {
+            py::gil_scoped_release release;
+            self.start();
+        }, "Spawn the consumer thread.")
+
+        .def("push_batch", [](StreamingIngestor& self,
+                              py::array_t<uint32_t, py::array::c_style | py::array::forcecast> src,
+                              py::array_t<uint32_t, py::array::c_style | py::array::forcecast> dst,
+                              py::array_t<uint32_t, py::array::c_style | py::array::forcecast> ts,
+                              py::object relations) {
+            if (src.size() != dst.size() || src.size() != ts.size()) {
+                throw std::invalid_argument("src, dst and timestamp must be the same length");
+            }
+            const uint32_t* sp = src.data();
+            const uint32_t* dp = dst.data();
+            const uint32_t* tp = ts.data();
+            const size_t n = static_cast<size_t>(src.size());
+
+            const EdgeRelation* rp = nullptr;
+            py::array_t<EdgeRelation, py::array::c_style | py::array::forcecast> rel_array;
+            if (!relations.is_none()) {
+                rel_array = relations.cast<py::array_t<EdgeRelation,
+                                py::array::c_style | py::array::forcecast>>();
+                if (static_cast<size_t>(rel_array.size()) != n) {
+                    throw std::invalid_argument("relation array length must match");
+                }
+                rp = rel_array.data();
+            }
+
+            // GIL released for the whole push: the producer blocks on
+            // back-pressure, and holding the GIL there would stall every other
+            // Python thread including the one decoding the next chunk.
+            py::gil_scoped_release release;
+            for (size_t i = 0; i < n; ++i) {
+                self.push({sp[i], dp[i], tp[i], rp ? rp[i] : RELATION_UNKNOWN});
+            }
+            return n;
+        }, py::arg("src"), py::arg("dst"), py::arg("timestamp"),
+           py::arg("relation") = py::none())
+
+        .def("drain", [](StreamingIngestor& self) {
+            py::gil_scoped_release release;
+            self.drain();
+        }, "Block until the consumer has caught up.")
+
+        .def("stop", [](StreamingIngestor& self) {
+            py::gil_scoped_release release;
+            self.stop();
+        }, "Drain the queue and join the consumer thread.")
+
+        .def("__enter__", [](StreamingIngestor& self) {
+            { py::gil_scoped_release release; self.start(); }
+            return &self;
+        }, py::return_value_policy::reference_internal)
+        .def("__exit__", [](StreamingIngestor& self, py::object, py::object, py::object) {
+            py::gil_scoped_release release;
+            self.stop();
+            return false;
+        })
+
+        .def_property_readonly("running", &StreamingIngestor::is_running)
+        .def_property_readonly("pushed", &StreamingIngestor::get_pushed)
+        .def_property_readonly("consumed", &StreamingIngestor::get_consumed)
+        .def_property_readonly("producer_spins", &StreamingIngestor::get_producer_spins)
+        .def_property_readonly("consumer_idle_polls", &StreamingIngestor::get_consumer_idle_polls)
+        .def_property_readonly("queue_capacity", &StreamingIngestor::get_queue_capacity);
 
     m.attr("EMPTY_GAP") = EMPTY_GAP;
     m.attr("RELATION_UNKNOWN") = RELATION_UNKNOWN;

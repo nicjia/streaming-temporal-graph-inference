@@ -75,6 +75,7 @@ PCSRGraph::PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity, size
       rebalance_count(0),
       resize_count(0),
       slots_rewritten(0),
+      writer_active(false),
       arena(arena_bytes) {
 
     if (num_vertices == 0) {

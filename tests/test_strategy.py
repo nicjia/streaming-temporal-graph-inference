@@ -24,7 +24,9 @@ sys.path.insert(0, os.path.join(ROOT, "python"))
 from backtest.engine import BacktestConfig, run_backtest  # noqa: E402
 from backtest.evaluate import average_precision, mean_reciprocal_rank, roc_auc  # noqa: E402
 from backtest.folds import walk_forward_folds  # noqa: E402
+from backtest.propagation import run_event_study  # noqa: E402
 from ingestion.corpus import CONFLICT_CLASSES, synthetic_corpus  # noqa: E402
+from ingestion.supply_chain import synthetic_supply_chain  # noqa: E402
 from ingestion.historical_replayer import DataReplayer, provision, to_unix_seconds  # noqa: E402
 from ingestion.id_mapper import EntityMapper  # noqa: E402
 from models import (PCSRTemporalSampler, build_intensity_targets,  # noqa: E402
@@ -636,6 +638,426 @@ def test_duplicate_instrument_aggregation():
           "gross exposure is not inflated by the duplicate")
 
 
+
+def test_bulk_matches_scalar():
+    print("\nBulk and scalar insertion agree")
+    import graph_engine
+
+    # The bulk path exists because per-edge calls cost ~1us at the language
+    # boundary. It is a separate code path through the same engine, so it can
+    # drift: a different rebalance order would still retain every edge while
+    # producing a different layout, and nothing else in the suite would notice.
+    rng = np.random.default_rng(7)
+    num_nodes, num_edges = 200, 50_000
+    src = rng.integers(0, num_nodes, num_edges).astype(np.uint32)
+    dst = rng.integers(0, num_nodes, num_edges).astype(np.uint32)
+    ts = np.sort(rng.integers(1_000, 90_000, num_edges)).astype(np.uint32)
+    rel = rng.integers(1, 50, num_edges).astype(np.uint16)
+
+    bulk = graph_engine.PCSRGraph(num_nodes, 256, 1 << 27)
+    bulk.insert_edges(src, dst, ts, rel)
+
+    scalar = graph_engine.PCSRGraph(num_nodes, 256, 1 << 27)
+    for i in range(num_edges):
+        scalar.insert_edge(int(src[i]), int(dst[i]), int(ts[i]), int(rel[i]))
+
+    check(bulk.resize_count > 0 and bulk.resize_count == scalar.resize_count,
+          "both paths grew the PMA the same number of times")
+    check(np.array_equal(np.asarray(bulk.get_vertex_offsets()),
+                         np.asarray(scalar.get_vertex_offsets())),
+          "region boundaries are identical")
+    check(np.array_equal(np.asarray(bulk.get_vertex_counts()),
+                         np.asarray(scalar.get_vertex_counts())),
+          "degrees are identical")
+
+    for name, left, right in zip(("src", "dst", "timestamp", "relation"),
+                                 bulk.to_coo(), scalar.to_coo()):
+        check(np.array_equal(left, right), f"{name} column is identical")
+
+
+
+def test_single_writer_guard():
+    print("\nConcurrent writers are rejected, not silently tolerated")
+    import threading
+    import graph_engine
+
+    # The bulk insert path releases the GIL to get its throughput, which means
+    # the interpreter lock no longer serialises writers for free. PCSRGraph is
+    # single-writer -- a rebalance rewrites whole windows -- so two concurrent
+    # bulk inserts used to interleave into corruption: measured at 53,592
+    # reported edges out of 160,000 inserted, with a full scan disagreeing with
+    # the counter and real edges lost. No crash, no warning.
+    num_nodes, per_thread = 500, 40_000
+
+    def batch(seed):
+        rng = np.random.default_rng(seed)
+        return (rng.integers(0, num_nodes, per_thread).astype(np.uint32),
+                rng.integers(0, num_nodes, per_thread).astype(np.uint32),
+                np.sort(rng.integers(1_000, 90_000, per_thread)).astype(np.uint32))
+
+    graph = graph_engine.PCSRGraph(num_nodes, 8 * per_thread, 1 << 28)
+    rejected = []
+
+    def writer(payload):
+        try:
+            graph.insert_edges(*payload)
+        except RuntimeError as error:
+            rejected.append(str(error))
+
+    threads = [threading.Thread(target=writer, args=(batch(i),)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    check(len(rejected) > 0, "at least one concurrent writer is turned away")
+    check(all("single-writer" in message for message in rejected),
+          "the rejection names the actual problem")
+
+    scanned = int(np.asarray(graph.get_vertex_counts()).sum())
+    check(scanned == graph.num_edges,
+          f"the graph stays consistent after contention "
+          f"(scan {scanned} vs counter {graph.num_edges})")
+    check(graph.num_edges % per_thread == 0,
+          "only whole successful batches are present")
+
+    # Serialised writers must all still succeed -- the guard must not be sticky.
+    serial = graph_engine.PCSRGraph(num_nodes, 8 * per_thread, 1 << 28)
+    for i in range(4):
+        serial.insert_edges(*batch(i))
+    check(serial.num_edges == 4 * per_thread,
+          "sequential writers are unaffected by the guard")
+    check(int(np.asarray(serial.get_vertex_counts()).sum()) == serial.num_edges,
+          "sequentially built graph is consistent")
+
+    # A guard released by an exception must not leave the graph locked.
+    tiny = graph_engine.PCSRGraph(4, 16, 1 << 20)
+    try:
+        tiny.insert_edge(99, 0, 1)
+    except IndexError:
+        pass
+    except Exception:
+        pass
+    tiny.insert_edge(0, 1, 1)
+    check(tiny.num_edges == 1, "a throwing insert releases the write guard")
+
+
+def test_determinism():
+    print("\nSeeded runs are reproducible")
+    import graph_engine
+    import torch
+
+    from models import PCSRTemporalSampler, TGATLinkModel
+
+    def build(seed):
+        events, _ = synthetic_corpus(num_days=40, events_per_day=120, seed=1)
+        conflict = events[events["quad_class"].isin(CONFLICT_CLASSES)].reset_index(drop=True)
+        countries = sorted(set(conflict["src"]) | set(conflict["dst"]))
+
+        path = tmp(f"determinism_{seed}.json")
+        if os.path.exists(path):
+            os.remove(path)
+        mapper = EntityMapper(filepath=path, max_entities=len(countries) + 8)
+
+        relations = conflict["event_root_code"].clip(0, 65534).astype(np.uint16).to_numpy()
+        replayer = DataReplayer.for_events(len(conflict), mapper.max_entities)
+        replayer.replay_events(conflict["src"].to_numpy(), conflict["dst"].to_numpy(),
+                               conflict["ts"].to_numpy(), mapper, quiet=True,
+                               relations=relations)
+        sampler = PCSRTemporalSampler(replayer.graph)
+
+        conflict = conflict.assign(
+            src_id=mapper.get_ids(conflict["src"].to_numpy()),
+            dst_id=mapper.get_ids(conflict["dst"].to_numpy()))
+        ids = np.array(sorted(set(conflict["dst_id"])))
+
+        torch.manual_seed(seed)
+        rng = np.random.default_rng(seed)
+        model = TGATLinkModel(mapper.max_entities, sampler, node_dim=16, time_dim=16,
+                              num_layers=2, num_neighbors=8,
+                              num_relations=int(relations.max()) + 1)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        model.train()
+
+        train = conflict.iloc[:2500]
+        for offset in range(0, len(train), 200):
+            batch = train.iloc[offset:offset + 200]
+            if len(batch) < 4:
+                continue
+            optimizer.zero_grad()
+            loss, _, _ = model.loss(batch["src_id"].to_numpy(), batch["dst_id"].to_numpy(),
+                                    batch["ts"].to_numpy(),
+                                    rng.choice(ids, len(batch)), rng.choice(ids, len(batch)))
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        test = conflict.iloc[2500:2800]
+        with torch.no_grad():
+            scores = model.score(test["src_id"].to_numpy(), test["dst_id"].to_numpy(),
+                                 test["ts"].to_numpy()).numpy()
+        return np.asarray(replayer.graph.get_vertex_counts()).copy(), scores
+
+    counts_a, scores_a = build(0)
+    counts_b, scores_b = build(0)
+    counts_c, scores_c = build(1)
+
+    check(np.array_equal(counts_a, counts_b), "graph construction is deterministic")
+    check(np.array_equal(scores_a, scores_b),
+          "the same seed reproduces model scores bit for bit")
+    check(not np.array_equal(scores_a, scores_c),
+          "a different seed actually changes the result")
+
+
+
+def test_propagation_recovers_planted_half_life():
+    print("\nPropagation event study recovers a known half-life")
+    from models import PCSRTemporalSampler
+
+    # A world where a shock at one firm genuinely reaches its suppliers with a
+    # known decay. If the estimator cannot recover a half-life that was planted
+    # deliberately, no number it reports on real data means anything.
+    planted, days, firms_n = 3.0, 900, 300
+    rng = np.random.default_rng(5)
+
+    links = synthetic_supply_chain(num_firms=firms_n, num_links=5000, seed=6)
+    firms = sorted(set(links["src"]) | set(links["dst"]))
+    index = {f: i for i, f in enumerate(firms)}
+    dates = pd.bdate_range("2019-01-02", periods=days)
+
+    suppliers = {}
+    for supplier, customer in zip(links["src"], links["dst"]):
+        suppliers.setdefault(customer, []).append(supplier)
+
+    shock = np.zeros((days, len(firms)))
+    events = []
+    decay = 0.5 ** (1.0 / planted)
+    for day in range(40, days - 40):
+        if rng.random() < 0.5:
+            firm = firms[rng.integers(0, len(firms))]
+            sign = 1.0 if rng.random() < 0.5 else -1.0
+            events.append((dates[day].date().isoformat(), firm, sign))
+            remaining = sign * 0.010
+            for h in range(1, 30):
+                if day + h >= days:
+                    break
+                for supplier in suppliers.get(firm, []):
+                    shock[day + h, index[supplier]] += remaining * (1 - decay)
+                remaining *= decay
+
+    event_frame = pd.DataFrame(events, columns=["date", "ticker", "sign"])
+    log_price = np.zeros(len(firms))
+    rows = []
+    for day in range(days):
+        log_price = log_price + shock[day] + rng.normal(0, 0.014, len(firms))
+        for firm, i in index.items():
+            rows.append((dates[day].date().isoformat(), firm,
+                         float(100 * np.exp(log_price[i]))))
+    prices = pd.DataFrame(rows, columns=["date", "ticker", "close"])
+
+    # Neighbourhoods come from the engine, as of the event date -- suppliers
+    # are gained and lost over time, so this must be a causal query.
+    path = tmp("propagation.json")
+    if os.path.exists(path):
+        os.remove(path)
+    mapper = EntityMapper(filepath=path, max_entities=len(firms) + 8)
+    replayer = DataReplayer.for_events(len(links), mapper.max_entities)
+    replayer.replay_events(links["dst"].to_numpy(), links["src"].to_numpy(),
+                           links["ts"].to_numpy(), mapper, quiet=True)
+    sampler = PCSRTemporalSampler(replayer.graph)
+    names = {mapper.get_id(f): f for f in firms if mapper.get_id(f) >= 0}
+
+    def neighbors(ticker, date):
+        node = mapper.get_id(ticker)
+        if node < 0:
+            return []
+        stamp = int(pd.Timestamp(date).timestamp())
+        ids, _, mask = sampler.sample(np.array([node]), np.array([stamp]), 32)
+        return [names[int(x)] for x in ids[0][mask[0]] if int(x) in names]
+
+    result = run_event_study(event_frame, neighbors, prices,
+                             horizons=(1, 2, 3, 5, 8, 12, 20), quiet=True)
+
+    recovered = result["half_life"]["difference"]
+    horizons = result["horizons"]
+    peak_t = max(abs(result["neighbors"][h][1]) for h in horizons
+                 if np.isfinite(result["neighbors"][h][1]))
+    # The placebo drifts negative by construction: demeaning the cross-section
+    # each day pushes non-treated firms down when the treated group is lifted.
+    # What must not happen is a placebo response in the *same* direction as the
+    # neighbours, which would mean genuine contamination rather than arithmetic.
+    placebo_same_direction = max(
+        (result["placebo"][h][1] for h in horizons
+         if np.isfinite(result["placebo"][h][1])), default=0.0)
+
+    print(f"       planted {planted:.1f}d -> recovered "
+          f"{recovered if recovered is None else round(recovered, 2)}d "
+          f"| peak t {peak_t:.1f} | placebo same-direction t {placebo_same_direction:+.2f}")
+
+    check(recovered is not None, "a half-life is recoverable at all")
+    check(recovered is not None and 1.0 < recovered < 7.0,
+          f"recovered half-life brackets the planted {planted}d (got {recovered})")
+    check(peak_t > 3.0, "the neighbour response is clearly distinguishable from noise")
+    check(placebo_same_direction < 2.0,
+          f"non-neighbours show no response in the treated direction "
+          f"(max t {placebo_same_direction:+.2f})")
+
+
+def test_streaming_ingestor_python():
+    print("\nStreaming ingestion from Python")
+    import graph_engine
+
+    num_nodes, num_events = 2000, 200_000
+    rng = np.random.default_rng(3)
+    src = rng.integers(0, num_nodes, num_events).astype(np.uint32)
+    dst = rng.integers(0, num_nodes, num_events).astype(np.uint32)
+    ts = np.sort(rng.integers(1_000, 900_000, num_events)).astype(np.uint32)
+    rel = rng.integers(1, 20, num_events).astype(np.uint16)
+
+    graph = graph_engine.PCSRGraph(num_nodes, 4 * num_events, 1 << 28)
+    ingestor = graph_engine.StreamingIngestor(graph, 4096)
+
+    with ingestor:
+        check(ingestor.running, "context manager starts the consumer")
+        for i in range(0, num_events, 8192):
+            ingestor.push_batch(src[i:i + 8192], dst[i:i + 8192],
+                                ts[i:i + 8192], rel[i:i + 8192])
+
+    check(not ingestor.running, "context manager stops the consumer")
+    check(ingestor.pushed == num_events, "every event was pushed")
+    check(ingestor.consumed == num_events, "every event was consumed")
+    check(graph.num_edges == num_events, "the graph holds every streamed event")
+    check(int(np.asarray(graph.get_vertex_counts()).sum()) == num_events,
+          "a full scan agrees with the counter")
+    check(ingestor.producer_spins > 0,
+          "a small queue exercised back-pressure rather than dropping")
+
+    # Relations must survive the handoff, and runs must stay chronological.
+    sampler_ok = True
+    from models import PCSRTemporalSampler
+    check(PCSRTemporalSampler(graph).validate(),
+          "streamed runs are chronologically ordered")
+    check(sampler_ok, "sampler accepts a streamed graph")
+
+
+
+def test_ethereum_loader():
+    print("\nEthereum loader")
+    import tempfile
+    from ingestion.ethereum import (REL_CONTRACT_CALL, REL_CONTRACT_CALL_ZERO,
+                                    REL_FAILED, REL_VALUE_TRANSFER, classify,
+                                    load_transactions)
+
+    # --- relation classification, on hand-built rows -----------------------
+    frame = pd.DataFrame({
+        "n_input_bytes": [0, 4, 4, 0, 4],
+        "value_f64": [1e18, 1e18, 0.0, 5e17, 0.0],
+        "to_address": [b"a", b"b", b"c", b"d", b"e"],
+        "success": [True, True, True, True, False],
+    })
+    codes = classify(frame)
+    check(codes[0] == REL_VALUE_TRANSFER, "no calldata + value => value transfer")
+    check(codes[1] == REL_CONTRACT_CALL, "calldata + value => contract call")
+    check(codes[2] == REL_CONTRACT_CALL_ZERO, "calldata + no value => zero-value call")
+    check(codes[4] == REL_FAILED, "a reverted transaction is typed as failed")
+    check(codes.dtype == np.uint16, "relation codes are uint16 for the engine")
+
+    # --- the filter-and-reindex path ---------------------------------------
+    # Three busy addresses transacting among themselves, plus a dust tail of
+    # one-shot addresses that must be removed without corrupting the ids.
+    rng = np.random.default_rng(0)
+    busy = [b"busy%02d" % i for i in range(3)]
+    rows = []
+    block = 100
+    for i in range(60):
+        a, b = rng.choice(len(busy), 2, replace=False)
+        rows.append((block + i, busy[a], busy[b], 1e18, 0, True, 0))
+    for i in range(40):  # dust: each address appears exactly once
+        rows.append((block + 60 + i, b"dust%03d" % i, busy[0], 0.0, 0, True, 4))
+
+    tx = pd.DataFrame(rows, columns=["block_number", "from_address", "to_address",
+                                     "value_f64", "gas_used", "success", "n_input_bytes"])
+    blocks = pd.DataFrame({"block_number": tx["block_number"].unique()})
+    blocks["timestamp"] = 1_700_000_000 + blocks["block_number"] * 12
+
+    with tempfile.TemporaryDirectory() as directory:
+        tx_path = os.path.join(directory, "transactions.parquet")
+        block_path = os.path.join(directory, "blocks.parquet")
+        tx.to_parquet(tx_path, index=False)
+        blocks.to_parquet(block_path, index=False)
+
+        table, addresses = load_transactions(tx_path, block_path, min_degree=5, quiet=True)
+
+        check(len(table) == 60, f"dust edges are dropped (kept {len(table)} of 100)")
+        check(len(addresses) == 3, f"only busy addresses survive (got {len(addresses)})")
+
+        # The engine allocates a region per vertex id, so ids must be dense.
+        used = set(table["src"]).union(table["dst"])
+        check(used == set(range(len(addresses))),
+              "surviving ids are re-indexed into a dense range with no gaps")
+        check(table["src"].max() < len(addresses) and table["dst"].max() < len(addresses),
+              "no id exceeds the address count")
+
+        check(table["ts"].is_monotonic_increasing, "output is chronological")
+        check(list(table.columns) == ["ts", "src", "dst", "relation", "value"],
+              "schema is the engine's edge tuple")
+
+        # Unfiltered, every address must still round-trip.
+        full, full_addresses = load_transactions(tx_path, block_path, min_degree=1, quiet=True)
+        check(len(full) == 100, "min_degree=1 keeps everything")
+        check(len(full_addresses) == 43, f"all addresses retained (got {len(full_addresses)})")
+        check(set(full["src"]).union(full["dst"]) == set(range(len(full_addresses))),
+              "unfiltered ids are also dense")
+
+
+def test_ethereum_end_to_end():
+    print("\nEthereum edges through the engine")
+    import tempfile
+    import graph_engine
+    from ingestion.ethereum import load_transactions
+    from models import PCSRTemporalSampler
+
+    rng = np.random.default_rng(4)
+    num_addresses, num_tx = 200, 20_000
+    frm = rng.integers(0, num_addresses, num_tx)
+    to = rng.integers(0, num_addresses, num_tx)
+    rows = pd.DataFrame({
+        "block_number": np.sort(rng.integers(1000, 3000, num_tx)),
+        "from_address": [b"a%04d" % i for i in frm],
+        "to_address": [b"a%04d" % i for i in to],
+        "value_f64": rng.choice([0.0, 1e17, 1e18], num_tx),
+        "gas_used": 21000, "success": True,
+        "n_input_bytes": rng.choice([0, 68], num_tx),
+    })
+    blocks = pd.DataFrame({"block_number": np.unique(rows["block_number"])})
+    blocks["timestamp"] = 1_700_000_000 + blocks["block_number"] * 12
+
+    with tempfile.TemporaryDirectory() as directory:
+        tx_path = os.path.join(directory, "tx.parquet")
+        block_path = os.path.join(directory, "bl.parquet")
+        rows.to_parquet(tx_path, index=False)
+        blocks.to_parquet(block_path, index=False)
+        table, addresses = load_transactions(tx_path, block_path, min_degree=5, quiet=True)
+
+    graph = graph_engine.PCSRGraph(len(addresses), len(table) * 3, 1 << 27)
+    graph.insert_edges(table["src"].to_numpy(np.uint32), table["dst"].to_numpy(np.uint32),
+                       table["ts"].to_numpy(np.int64).astype(np.uint32),
+                       table["relation"].to_numpy(np.uint16))
+
+    check(graph.num_edges == len(table), "every loaded edge reaches the engine")
+    sampler = PCSRTemporalSampler(graph)
+    check(sampler.validate(), "adjacency runs are chronological")
+
+    # Relations must survive, and the sampler must return them aligned.
+    ids, times, mask, relations = sampler.sample(
+        np.arange(min(50, len(addresses))),
+        np.full(min(50, len(addresses)), int(table["ts"].max())), 16, with_relations=True)
+    check(relations[mask].max() <= table["relation"].max(),
+          "sampled relations stay within the classified vocabulary")
+    check(bool((times[mask] <= int(table["ts"].max())).all()),
+          "sampled events respect the query time")
+
+
 def main():
     test_id_mapper()
     test_timestamps()
@@ -653,6 +1075,13 @@ def main():
     test_information_coefficient()
     test_reversal_baseline()
     test_edge_relations_roundtrip()
+    test_bulk_matches_scalar()
+    test_single_writer_guard()
+    test_determinism()
+    test_streaming_ingestor_python()
+    test_propagation_recovers_planted_half_life()
+    test_ethereum_loader()
+    test_ethereum_end_to_end()
     test_fx_universe()
     test_duplicate_instrument_aggregation()
 

@@ -288,6 +288,136 @@ void test_edge_relations() {
              "omitting the relation defaults to RELATION_UNKNOWN");
 }
 
+void test_differential_fuzz() {
+    // Randomised operation sequences checked against a reference model.
+    //
+    // Every other test in this file is a scenario somebody thought of. The
+    // failure modes this structure actually has -- a rebalance window that
+    // straddles a resize, a hot vertex whose region migrates twice in a row --
+    // live in interleavings nobody enumerates. So: random shapes, random
+    // degrees, random capacities, and a std::multimap that must agree exactly,
+    // including insertion order within each vertex and the relation on every
+    // edge.
+    std::cout << "Differential fuzz against a reference model\n";
+
+    uint32_t configurations = 0;
+    uint64_t total_edges = 0;
+    uint32_t growth_seen = 0;
+    uint32_t rebalance_seen = 0;
+    bool all_match = true;
+
+    for (uint32_t seed = 0; seed < 120; ++seed) {
+        std::mt19937 rng(seed * 7919 + 13);
+
+        const uint32_t vertices = 1 + rng() % 96;
+        const uint32_t capacity = 1 + rng() % 512;
+        const uint32_t operations = rng() % 6000;
+        // Skew ranges from uniform to one vertex owning nearly everything.
+        const uint32_t skew = rng() % 4;
+
+        PCSRGraph graph(vertices, capacity, 48 * 1024 * 1024);
+        std::map<uint32_t, std::vector<std::pair<uint32_t, EdgeRelation>>> oracle;
+
+        uint32_t timestamp = 1;
+        for (uint32_t op = 0; op < operations; ++op) {
+            uint32_t src;
+            switch (skew) {
+                case 0:  src = rng() % vertices; break;                    // uniform
+                case 1:  src = (rng() % 4 == 0) ? 0 : rng() % vertices; break;
+                case 2:  src = rng() % std::max(1u, vertices / 8); break;  // narrow band
+                default: src = 0; break;                                   // degenerate
+            }
+            const uint32_t dst = rng() % vertices;
+            const EdgeRelation relation = static_cast<EdgeRelation>(rng() % 300 + 1);
+
+            graph.insert_edge(src, dst, timestamp, relation);
+            oracle[src].push_back({dst, relation});
+            ++timestamp;
+        }
+
+        if (graph.get_resize_count() > 0) ++growth_seen;
+        if (graph.get_rebalance_count() > 0) ++rebalance_seen;
+
+        // Read the graph back and compare, vertex by vertex, in order.
+        const uint32_t* offsets = graph.get_vertex_offsets();
+        const uint32_t* counts = graph.get_vertex_counts();
+        const TemporalEdge* edges = graph.get_edges();
+        const EdgeRelation* relations = graph.get_edge_relations();
+
+        bool matched = (graph.get_num_edges() == operations);
+        for (uint32_t v = 0; v < vertices && matched; ++v) {
+            const auto& expected = oracle[v];
+            if (counts[v] != expected.size()) { matched = false; break; }
+            for (uint32_t i = 0; i < counts[v]; ++i) {
+                const uint32_t slot = offsets[v] + i;
+                if (edges[slot].target_node != expected[i].first ||
+                    relations[slot] != expected[i].second) {
+                    matched = false;
+                    break;
+                }
+            }
+        }
+
+        if (!matched) {
+            all_match = false;
+            std::cout << "    mismatch at seed " << seed << " (vertices=" << vertices
+                      << " capacity=" << capacity << " ops=" << operations
+                      << " skew=" << skew << ")\n";
+        }
+        ++configurations;
+        total_edges += operations;
+    }
+
+    check(all_match, "every random configuration matches the reference model exactly");
+    check(growth_seen > 10, "the fuzz corpus exercised PMA growth");
+    check(rebalance_seen > 10, "the fuzz corpus exercised rebalancing");
+    std::cout << "    " << configurations << " random configurations, "
+              << total_edges << " edges, " << growth_seen << " with growth, "
+              << rebalance_seen << " with rebalancing\n";
+}
+
+void test_arena_exhaustion_mid_resize() {
+    // Growth allocates five arrays. If the arena runs dry on the third, the
+    // graph must be left exactly as it was -- not half-migrated.
+    //
+    // It is safe by construction: resize_pma reseats no pointer until every
+    // allocation has succeeded, so the failure is strongly exception-safe. That
+    // is a property worth pinning down, because the obvious refactor -- assign
+    // each pointer as it is allocated -- would quietly destroy it.
+    std::cout << "Arena exhaustion during growth\n";
+
+    for (size_t megabytes = 1; megabytes <= 4; ++megabytes) {
+        PCSRGraph graph(64, 4096, megabytes * 1024 * 1024);
+        uint64_t inserted = 0;
+        bool threw = false;
+
+        try {
+            for (uint32_t k = 0; k < 2000000; ++k) {
+                graph.insert_edge(k % 64, (k * 7) % 64, k + 1,
+                                  static_cast<EdgeRelation>(k % 19 + 1));
+                ++inserted;
+            }
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+
+        check(threw, "an undersized arena throws rather than overrunning");
+        check_eq(graph.get_num_edges(), inserted,
+                 "the failed insert did not increment the edge count");
+
+        uint64_t scanned = 0;
+        const uint32_t* offsets = graph.get_vertex_offsets();
+        const uint32_t* counts = graph.get_vertex_counts();
+        for (uint32_t v = 0; v < 64; ++v) {
+            scanned += counts[v];
+        }
+        check_eq(scanned, inserted, "every edge inserted before the failure survives");
+        check_eq(offsets[64], graph.get_edge_capacity(),
+                 "the region map still covers the array after a failed resize");
+        check_invariants(graph, "post-exhaustion");
+    }
+}
+
 void test_boundaries() {
     std::cout << "Boundary conditions\n";
 
@@ -370,6 +500,8 @@ int main() {
     test_all_edges_on_one_vertex();
     test_chronological_order_preserved();
     test_edge_relations();
+    test_differential_fuzz();
+    test_arena_exhaustion_mid_resize();
     test_boundaries();
     test_cache_alignment();
     test_arena_exhaustion();

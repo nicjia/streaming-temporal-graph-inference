@@ -1,8 +1,11 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
+#include <span>
 #include <cstddef>
 #include "types.hpp"
 #include "memory_arena.hpp"
+#include <stdexcept>
 
 /**
  * @brief Packed Compressed Sparse Row graph over a Packed Memory Array.
@@ -37,6 +40,9 @@ class PCSRGraph {
         uint64_t resize_count;
         uint64_t slots_rewritten;
 
+        // Single-writer enforcement. See WriteGuard.
+        std::atomic<bool> writer_active;
+
         MemoryArena arena;
 
         uint32_t* vertex_offsets;  // size = num_vertices + 1
@@ -57,6 +63,49 @@ class PCSRGraph {
         void resize_pma(uint32_t hot);
     public:
         /**
+         * @brief Asserts exclusive write access for its lifetime.
+         *
+         * PCSRGraph is single-writer: a rebalance rewrites whole windows of the
+         * edge array and reseats vertex offsets, so two concurrent mutators
+         * interleave into corruption rather than merely racing on a counter.
+         *
+         * This matters specifically because the Python bulk-insert path
+         * releases the GIL to get its throughput. Before that, the interpreter
+         * lock serialised every call for free; afterwards two Python threads
+         * could sit inside the same graph's insert loop at once. Measured, that
+         * lost roughly two thirds of the edges and left the reported edge count
+         * disagreeing with a full scan -- silently, with no crash.
+         *
+         * Throwing rather than locking is deliberate: concurrent mutation is a
+         * programming error here, not a case to serialise transparently, and a
+         * mutex would hide the mistake while halving the throughput the GIL
+         * release was bought for. Readers are unaffected; a graph with no
+         * active writer can be read from any number of threads.
+         */
+        class WriteGuard {
+            PCSRGraph* graph;
+        public:
+            explicit WriteGuard(PCSRGraph& target) : graph(&target) {
+                bool expected = false;
+                if (!graph->writer_active.compare_exchange_strong(
+                        expected, true, std::memory_order_acq_rel)) {
+                    graph = nullptr;  // do not release a lock we never took
+                    throw std::runtime_error(
+                        "PCSRGraph is single-writer: another thread is already "
+                        "inserting into this graph. Serialise your writers, or "
+                        "give each thread its own graph.");
+                }
+            }
+            ~WriteGuard() {
+                if (graph) {
+                    graph->writer_active.store(false, std::memory_order_release);
+                }
+            }
+            WriteGuard(const WriteGuard&) = delete;
+            WriteGuard& operator=(const WriteGuard&) = delete;
+        };
+
+        /**
          * @brief Constructs a PCSR Graph instance.
          * @param max_vertices Maximum number of nodes in the graph (V). Must be > 0.
          * @param initial_edge_capacity Initial size of the Packed Memory Array (E + Gaps).
@@ -70,6 +119,32 @@ class PCSRGraph {
 
         void insert_edge(uint32_t src, uint32_t dst, uint32_t timestamp,
                          EdgeRelation relation = RELATION_UNKNOWN);
+
+        /**
+         * @brief The live out-edges of a vertex, as a contiguous span.
+         *
+         * Prefer this over indexing get_edges() with get_vertex_offsets(). The
+         * obvious hand-written loop
+         *
+         *     for (i = 0; i < counts[v]; ++i) sum += edges[offsets[v] + i]...
+         *
+         * runs at less than half speed, because the compiler cannot prove the
+         * edge array does not alias the counts array and so reloads counts[v]
+         * on every iteration. Measured at 4.4 GB/s against 10.0 GB/s for the
+         * identical loop with the bound hoisted into a local. Handing back a
+         * span makes the fast form the natural one.
+         *
+         * Regions are left-packed, so the span is gap-free and contains
+         * exactly the live edges in insertion order.
+         */
+        std::span<const TemporalEdge> neighbors(uint32_t v) const {
+            return {edges + vertex_offsets[v], vertex_counts[v]};
+        }
+
+        /// Relation codes parallel to neighbors(v), same indices.
+        std::span<const EdgeRelation> neighbor_relations(uint32_t v) const {
+            return {edge_relations + vertex_offsets[v], vertex_counts[v]};
+        }
 
         const uint32_t* get_vertex_offsets() const { return vertex_offsets; }
         const uint32_t* get_vertex_counts() const { return vertex_counts; }

@@ -24,7 +24,7 @@ HDR = $(wildcard csrc/include/*.hpp)
 
 EXT = graph_engine$(PYTHON_SUFFIX)
 
-.PHONY: all ext tests test bench clean
+.PHONY: all ext tests test bench asan tsan clean
 
 all: ext tests
 
@@ -32,30 +32,53 @@ all: ext tests
 ext: $(EXT)
 
 $(EXT): $(SRC) $(HDR) csrc/bindings/pybind_module.cpp
-	$(CXX) $(CXXFLAGS) $(LDFLAGS_EXT) $(PYBIND_INCL) \
+	$(CXX) $(CXXFLAGS) -pthread $(LDFLAGS_EXT) $(PYBIND_INCL) \
 	$(SRC) csrc/bindings/pybind_module.cpp \
 	-o $(EXT)
 	@echo "Python extension built successfully!"
 
 # Build the C++ executables directly into the main folder
-tests: test_pcsr cpp_perf_test
+tests: test_pcsr test_spsc cpp_perf_test cache_comparison
 
 test_pcsr: $(SRC) $(HDR) tests/test_pcsr.cpp
 	$(CXX) $(CXXFLAGS) $(SRC) tests/test_pcsr.cpp -o test_pcsr
 	@echo "Unit test binary compiled as ./test_pcsr"
+
+test_spsc: $(SRC) $(HDR) tests/test_spsc.cpp
+	$(CXX) $(CXXFLAGS) -pthread $(SRC) tests/test_spsc.cpp -o test_spsc
+	@echo "SPSC queue test binary compiled as ./test_spsc"
+
+cache_comparison: $(SRC) $(HDR) benchmarks/cache_comparison.cpp
+	$(CXX) $(CXXFLAGS) $(SRC) benchmarks/cache_comparison.cpp -o cache_comparison
+	@echo "Layout comparison compiled as ./cache_comparison"
 
 cpp_perf_test: $(SRC) $(HDR) benchmarks/cpp_perf_test.cpp
 	$(CXX) $(CXXFLAGS) $(SRC) benchmarks/cpp_perf_test.cpp -o cpp_perf_test
 	@echo "Performance test binary compiled as ./cpp_perf_test"
 
 # Run the C++ unit tests
-test: test_pcsr
+test: test_pcsr test_spsc
 	./test_pcsr
+	./test_spsc
+
+# Memory safety. The engine hand-manages an arena and does its own pointer
+# arithmetic, so these are the tests that matter most for it.
+asan:
+	$(CXX) -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+	-I csrc/include $(SRC) tests/test_pcsr.cpp -o /tmp/asan_pcsr
+	UBSAN_OPTIONS=print_stacktrace=1 /tmp/asan_pcsr
+
+# Data races in the lock-free queue. Throughput proves nothing about the
+# correctness of its memory ordering; this does.
+tsan:
+	$(CXX) -std=c++20 -O1 -g -fsanitize=thread -pthread \
+	-I csrc/include $(SRC) tests/test_spsc.cpp -o /tmp/tsan_spsc
+	/tmp/tsan_spsc
 
 # Run the C++ insertion benchmark
 bench: cpp_perf_test
 	./cpp_perf_test
 
 clean:
-	rm -f graph_engine*.so test_pcsr cpp_perf_test
+	rm -f graph_engine*.so test_pcsr test_spsc cpp_perf_test cache_comparison
 	@echo "Cleaned up old builds."

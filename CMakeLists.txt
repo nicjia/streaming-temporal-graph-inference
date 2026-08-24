@@ -42,8 +42,17 @@ add_executable(test_pcsr tests/test_pcsr.cpp)
 target_link_libraries(test_pcsr PRIVATE graph_core)
 add_test(NAME pcsr_unit_tests COMMAND test_pcsr)
 
+# The queue is header-only and needs no engine, but it does need threads.
+find_package(Threads REQUIRED)
+add_executable(test_spsc tests/test_spsc.cpp)
+target_link_libraries(test_spsc PRIVATE graph_core Threads::Threads)
+add_test(NAME spsc_queue_tests COMMAND test_spsc)
+
 add_executable(cpp_perf_test benchmarks/cpp_perf_test.cpp)
 target_link_libraries(cpp_perf_test PRIVATE graph_core)
+
+add_executable(cache_comparison benchmarks/cache_comparison.cpp)
+target_link_libraries(cache_comparison PRIVATE graph_core)
 
 # ---- python extension ------------------------------------------------------
 # Optional so the C++ core can be built and tested with no Python toolchain.
@@ -52,7 +61,7 @@ if(BUILD_PYTHON_MODULE)
     if(pybind11_FOUND)
         # Module name must match the Makefile output and `import graph_engine`.
         pybind11_add_module(graph_engine csrc/bindings/pybind_module.cpp)
-        target_link_libraries(graph_engine PRIVATE graph_core)
+        target_link_libraries(graph_engine PRIVATE graph_core Threads::Threads)
     else()
         message(STATUS "pybind11 not found - skipping the Python extension. "
                        "Install it with: pip install pybind11")
