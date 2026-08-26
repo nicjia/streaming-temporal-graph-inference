@@ -30,16 +30,29 @@ def abnormal_returns(prices):
     frame["date"] = pd.to_datetime(frame["date"])
     wide = frame.pivot_table(index="date", columns="ticker", values="close",
                              aggfunc="last").sort_index()
+    # Force float: a Postgres numeric column arrives as Decimal objects, which
+    # pivot preserves as dtype object, and every downstream numpy call then
+    # fails on a type error rather than on anything meaningful.
+    wide = wide.astype("float64")
     returns = wide.pct_change(fill_method=None)
     return returns.sub(returns.mean(axis=1), axis=0)
 
 
 def cumulative_response(abnormal, dates, tickers, signs, horizons):
     """
-    Mean sign-adjusted cumulative abnormal return at each horizon.
+    Mean sign-adjusted cumulative abnormal return at each horizon, with
+    standard errors clustered on the event date.
 
     `signs` orients each observation so a positive shock and a negative shock
     of the same magnitude reinforce rather than cancel.
+
+    The clustering is not optional here. One revision contributes every firm the
+    analyst covers -- typically 77 of them -- all sharing a date and heavily
+    overlapping across events, so 3,000 events produce 230,000 rows that are
+    nowhere near independent. Treating them as iid inflates t-statistics by
+    roughly the square root of the cluster size, which is how an economically
+    trivial 13 bp effect arrives looking like t = -2.2. Averaging within event
+    date first and testing across dates is the conservative correction.
     """
     index = {d: i for i, d in enumerate(abnormal.index)}
     columns = {t: i for i, t in enumerate(abnormal.columns)}
@@ -47,7 +60,7 @@ def cumulative_response(abnormal, dates, tickers, signs, horizons):
 
     out = {}
     for horizon in horizons:
-        collected = []
+        collected, cluster_keys = [], []
         for date, ticker, sign in zip(dates, tickers, signs):
             row = index.get(date)
             col = columns.get(ticker)
@@ -60,17 +73,24 @@ def cumulative_response(abnormal, dates, tickers, signs, horizons):
             if window.size == 0 or np.isnan(window).all():
                 continue
             collected.append(sign * np.nansum(window))
+            cluster_keys.append(date)
         if collected:
             arr = np.asarray(collected, dtype=float)
-            deviation = arr.std(ddof=1)
-            standard_error = deviation / np.sqrt(len(arr)) if deviation > 0 else float("nan")
-            out[horizon] = (float(arr.mean()),
-                            float(arr.mean() / standard_error) if standard_error > 0
-                            else float("nan"),
+            keys = np.asarray(cluster_keys, dtype=object)
+            frame = pd.DataFrame({"value": arr, "cluster": keys})
+            per_cluster = frame.groupby("cluster")["value"].mean().to_numpy()
+
+            deviation = per_cluster.std(ddof=1) if len(per_cluster) > 1 else 0.0
+            standard_error = (deviation / np.sqrt(len(per_cluster))
+                              if deviation > 0 else float("nan"))
+            out[horizon] = (float(per_cluster.mean()),
+                            float(per_cluster.mean() / standard_error)
+                            if standard_error > 0 else float("nan"),
                             len(arr),
-                            float(standard_error))
+                            float(standard_error),
+                            len(per_cluster))
         else:
-            out[horizon] = (float("nan"), float("nan"), 0, float("nan"))
+            out[horizon] = (float("nan"), float("nan"), 0, float("nan"), 0)
     return out
 
 
@@ -90,17 +110,19 @@ def difference_curves(treated, control, horizons):
     """
     out = {}
     for horizon in horizons:
-        t_mean, _, t_n, t_se = treated[horizon]
-        c_mean, _, c_n, c_se = control[horizon]
+        t_mean, _, t_n, t_se = treated[horizon][:4]
+        c_mean, _, c_n, c_se = control[horizon][:4]
         if not (np.isfinite(t_mean) and np.isfinite(c_mean)):
-            out[horizon] = (float("nan"), float("nan"), 0, float("nan"))
+            out[horizon] = (float("nan"), float("nan"), 0, float("nan"), 0)
             continue
         delta = t_mean - c_mean
         se = np.sqrt((t_se ** 2 if np.isfinite(t_se) else 0.0) +
                      (c_se ** 2 if np.isfinite(c_se) else 0.0))
         out[horizon] = (float(delta),
                         float(delta / se) if se > 0 else float("nan"),
-                        min(t_n, c_n), float(se))
+                        min(t_n, c_n), float(se),
+                        min(treated[horizon][4], control[horizon][4])
+                        if len(treated[horizon]) > 4 else 0)
     return out
 
 
@@ -207,6 +229,9 @@ def report(result):
             mean, t_stat = result[key][h][0], result[key][h][1]
             cells.append(f"{mean:+.5f} / {t_stat:+6.2f}")
         print(f"{h:<10}" + "".join(f"{c:>24}" for c in cells))
+    first = horizons[0]
+    if len(result["neighbors"][first]) > 4:
+        print(f"  clusters (event dates): {result['neighbors'][first][4]}")
     print(f"\n  observations: {result['neighbors'][horizons[0]][2]} neighbour, "
           f"{result['placebo'][horizons[0]][2]} placebo, "
           f"{result['own'][horizons[0]][2]} own-firm events")

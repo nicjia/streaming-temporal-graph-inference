@@ -24,3 +24,8 @@ cmake-build-*/
 data/
 results/
 results_fx/
+
+# model checkpoints and bulk datasets
+*.pt
+data/tgb/
+data/bts/

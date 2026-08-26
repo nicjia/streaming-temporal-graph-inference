@@ -915,7 +915,10 @@ def test_streaming_ingestor_python():
     rel = rng.integers(1, 20, num_events).astype(np.uint16)
 
     graph = graph_engine.PCSRGraph(num_nodes, 4 * num_events, 1 << 28)
-    ingestor = graph_engine.StreamingIngestor(graph, 4096)
+    # Queue far smaller than the batch size, so the producer must block. With a
+    # queue larger than a batch, whether back-pressure happens at all depends on
+    # thread scheduling, and the assertion below becomes flaky.
+    ingestor = graph_engine.StreamingIngestor(graph, 64)
 
     with ingestor:
         check(ingestor.running, "context manager starts the consumer")
