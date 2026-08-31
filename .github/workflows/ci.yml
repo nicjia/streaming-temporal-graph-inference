@@ -79,7 +79,7 @@ jobs:
           # CPU-only torch: the default wheel pulls ~2 GB of CUDA that no
           # runner here can use.
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pybind11 numpy pandas networkx psutil pyarrow
+          pip install pybind11 numpy pandas networkx psutil pyarrow scikit-learn
 
       - name: Build the extension
         run: make ext ARCH_FLAGS=

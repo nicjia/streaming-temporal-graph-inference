@@ -1,11 +1,13 @@
 """
 At what timescale does edge ordering actually carry information?
 
-There is a live question in the temporal-graph literature about whether the
-standard benchmarks are temporal at all. "What Do Temporal Graph Learning
-Models Learn?" (arXiv 2510.09416, 2025) reports that permuting timestamps among
-training edges often barely dents performance -- which would mean much of what
-TGN and TGAT are credited with is a recency heuristic wearing a clock.
+There is a live question in the temporal-graph literature about whether standard
+scores measure genuine temporal reasoning. Rahman, Modell and Coon (ICLR 2025
+Workshop) evaluate temporally distorted test splits, while Cornell et al. (ICLR
+2025 Workshop) show that recency and popularity heuristics can match or beat
+neural temporal-graph models under common protocols. This experiment asks a
+different counterfactual: after retraining from scratch, how much skill survives
+when edge-time pairing is destroyed at a controlled timescale?
 
 A single shuffled-versus-chronological number cannot settle that, because it
 conflates two very different failures: a model that ignores order entirely, and

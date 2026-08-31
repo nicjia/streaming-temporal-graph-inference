@@ -13,6 +13,8 @@ Run: python tests/test_strategy.py
 import os
 import sys
 import time
+import json
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -1061,6 +1063,146 @@ def test_ethereum_end_to_end():
           "sampled events respect the query time")
 
 
+def test_dex_cross_pool_markout():
+    print("\nDEX cross-pool markout")
+    from ingestion.dex import ORDER_SLOTS_PER_BLOCK, add_cross_pool_markout
+
+    frame = pd.DataFrame({
+        "block": [100, 101, 110],
+        "pool": [0, 1, 0],
+        "event_time": [1, ORDER_SLOTS_PER_BLOCK + 1,
+                       10 * ORDER_SLOTS_PER_BLOCK + 1],
+        "log_price": np.log([1000.0, 1100.0, 1200.0]),
+        "direction": [1, -1, 1],
+        "notional_usdc": [1000.0, 1100.0, 1200.0],
+    })
+    marked = add_cross_pool_markout(frame, horizon_blocks=1,
+                                    max_abs_bps=None)
+    expected = np.log(1.1) * 10_000
+    check(abs(marked.loc[0, "markout_bps"] - expected) < 1e-9,
+          "a buy is toxic when the other pool rises after execution")
+    check(marked.loc[0, "adverse_selection_usdc"] > 0,
+          "positive markout maps to positive LP adverse selection")
+    check(np.isnan(marked.loc[2, "markout_bps"]),
+          "a stale other-pool quote is not carried into the label")
+
+
+def test_aave_liquidation_deduplication():
+    print("\nAave liquidation ingestion")
+    from ingestion.aave import load_aave_events
+
+    base = {
+        "event_type": "liquidationCall", "block_number": 100,
+        "timestamp": 1_700_000_000, "tx_index": 2, "log_index": 9,
+        "transaction_hash": "0xabc", "user": "0xUser",
+    }
+    collateral = dict(base, asset="0xCOLL", asset_role="collateral",
+                      debt_asset="0xDEBT")
+    debt = dict(base, asset="0xDEBT", asset_role="debt",
+                debt_asset="0xDEBT")
+    supply = {
+        "event_type": "supply", "block_number": 90,
+        "timestamp": 1_699_999_000, "tx_index": 1, "log_index": 3,
+        "transaction_hash": "0xsupply", "user": "0xUser",
+        "asset": "0xCOLL", "asset_role": "reserve",
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        source = os.path.join(directory, "AaveEventData")
+        os.makedirs(source)
+        with open(os.path.join(source, "coll.json"), "w") as handle:
+            json.dump([supply, collateral], handle)
+        with open(os.path.join(source, "debt.json"), "w") as handle:
+            json.dump([debt], handle)
+        events, liquidations = load_aave_events(source, use_cache=False)
+
+    check(len(events) == 3, "both typed liquidation legs remain graph events")
+    check(len(liquidations) == 1, "collateral/debt copies become one economic event")
+    check(liquidations.loc[0, "collateral"] == "0xcoll"
+          and liquidations.loc[0, "debt"] == "0xdebt",
+          "the merged liquidation recovers both exposure legs")
+    check(events["block"].is_monotonic_increasing,
+          "Aave graph events are chronological")
+
+
+def test_aave_candidate_sampling_is_canonical():
+    print("\nAave candidate sampling")
+    from ingestion.aave import sample_candidates
+
+    left = sample_candidates({"c", "a", "b"}, 2, np.random.default_rng(7), set())
+    right = sample_candidates({"b", "c", "a"}, 2, np.random.default_rng(7), set())
+    check(left == right, "set insertion order cannot change a seeded sample")
+
+
+def test_earnings_event_alignment():
+    print("\nEarnings event alignment")
+    from ingestion.earnings import attach_crsp_reactions, prepare_earnings_events
+
+    dates = pd.bdate_range("2024-01-02", periods=45)
+    returns = pd.DataFrame({
+        "permno": np.repeat([101, 202], len(dates)),
+        "date": np.tile(dates, 2),
+        "ret": 0.0,
+    })
+    announcement = dates[25]
+    returns.loc[(returns["permno"] == 101)
+                & (returns["date"] == dates[26]), "ret"] = 0.10
+    returns.loc[(returns["permno"] == 202)
+                & (returns["date"] == dates[25]), "ret"] = -0.08
+    base = {
+        "ticker": ["AFTER", "BEFORE"], "oftic": ["AFTER", "BEFORE"],
+        "cname": ["After", "Before"], "fpedats": [dates[20], dates[20]],
+        "anndats_act": [announcement, announcement],
+        "anntims_act": ["16:15:00", "08:00:00"],
+        "statpers": [dates[24], dates[24]], "meanest": [1.0, 1.0],
+        "medest": [1.0, 1.0], "stdev": [.1, .1], "numest": [10, 10],
+        "actual": [1.1, .9], "permno": [101, 202], "secid": [1, 2],
+        "ibes_link_score": [1, 1], "option_link_score": [1, 1],
+    }
+    events = prepare_earnings_events(pd.DataFrame(base))
+    panel = attach_crsp_reactions(events, returns)
+    after = panel[panel["ticker"] == "AFTER"].iloc[0]
+    before = panel[panel["ticker"] == "BEFORE"].iloc[0]
+    check(after["reaction_date"] == dates[26]
+          and abs(after["reaction_1d"] - .10) < 1e-12,
+          "after-close earnings react on the next trading day")
+    check(before["reaction_date"] == dates[25]
+          and abs(before["reaction_1d"] + .08) < 1e-12,
+          "before-open earnings react on the same trading day")
+    check(bool((events["statpers"] < events["anndats_act"]).all()),
+          "every consensus snapshot strictly precedes its announcement")
+
+
+def test_earnings_temporal_features():
+    print("\nEarnings temporal features")
+    from models.earnings_distribution import (_causal_time_ewm,
+                                              build_standardized_event_variance)
+
+    values = np.array([1.0, 3.0, 9.0])
+    clock = np.array([0, 1, 2], dtype=np.int64)
+    weighted = _causal_time_ewm(values, clock, half_life_days=1)
+    check(np.isnan(weighted[0]) and abs(weighted[1] - 1.0) < 1e-12,
+          "irregular-time weighting never admits the current event")
+    check(abs(weighted[2] - 7 / 3) < 1e-12,
+          "calendar-time decay weights prior observations correctly")
+
+    rows = []
+    for days in (10, 30, 60):
+        maturity = days / 365
+        total_variance = .01 + .04 * maturity
+        iv = np.sqrt(total_variance / maturity)
+        rows.append({
+            "event_id": 1, "days": days, "forward_price": 100,
+            "call_premium": 5, "put_premium": 5,
+            "call_iv": iv, "put_iv": iv,
+            "call_delta": .5, "put_delta": -.5,
+        })
+    term = build_standardized_event_variance(pd.DataFrame(rows)).iloc[0]
+    check(abs(term["std_event_variance"] - .01) < 1e-12,
+          "term-structure decomposition recovers scheduled event variance")
+    check(abs(term["std_diffusive_variance"] - .04) < 1e-12,
+          "term-structure decomposition recovers diffusive variance")
+
+
 def main():
     test_id_mapper()
     test_timestamps()
@@ -1085,6 +1227,11 @@ def main():
     test_propagation_recovers_planted_half_life()
     test_ethereum_loader()
     test_ethereum_end_to_end()
+    test_dex_cross_pool_markout()
+    test_aave_liquidation_deduplication()
+    test_aave_candidate_sampling_is_canonical()
+    test_earnings_event_alignment()
+    test_earnings_temporal_features()
     test_fx_universe()
     test_duplicate_instrument_aggregation()
 
