@@ -211,6 +211,42 @@ def test_attention_layer():
         check(True, "out_dim not divisible by num_heads is rejected")
 
 
+def test_weighted_event_payload():
+    print("\nWeighted event payload")
+
+    def weighted_graph(value):
+        graph = graph_engine.PCSRGraph(3, 32, 1 << 20, store_weights=True)
+        graph.insert_edges(
+            np.array([0], dtype=np.uint32),
+            np.array([1], dtype=np.uint32),
+            np.array([10], dtype=np.uint32),
+            None,
+            np.array([value], dtype=np.float32),
+        )
+        return graph
+
+    torch.manual_seed(17)
+    low = TGAT(3, PCSRTemporalSampler(weighted_graph(-1.0)), node_dim=8,
+               time_dim=8, num_layers=1, num_neighbors=2, dropout=0.0,
+               edge_dim=4).eval()
+    torch.manual_seed(17)
+    high = TGAT(3, PCSRTemporalSampler(weighted_graph(+1.0)), node_dim=8,
+                time_dim=8, num_layers=1, num_neighbors=2, dropout=0.0,
+                edge_dim=4).eval()
+    with torch.no_grad():
+        low_h = low(np.array([0]), np.array([20]))
+        high_h = high(np.array([0]), np.array([20]))
+    check(not torch.allclose(low_h, high_h),
+          "edge payload changes the temporal embedding")
+
+    try:
+        TGAT(3, PCSRTemporalSampler(build_graph(
+            np.array([0]), np.array([1]), np.array([10]), 3)), edge_dim=4)
+        check(False, "payload-aware TGAT rejects an unweighted graph")
+    except ValueError:
+        check(True, "payload-aware TGAT rejects an unweighted graph")
+
+
 def test_no_future_leakage():
     print("\nEnd-to-end causality")
     rng = np.random.default_rng(3)
@@ -317,6 +353,7 @@ def main():
     test_time_encoding()
     test_sampler_causality()
     test_attention_layer()
+    test_weighted_event_payload()
     test_no_future_leakage()
     test_link_prediction_learns()
 

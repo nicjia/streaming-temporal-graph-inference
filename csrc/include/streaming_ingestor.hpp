@@ -37,6 +37,7 @@ public:
         uint32_t dst;
         uint32_t timestamp;
         EdgeRelation relation;
+        float weight;
     };
 
 private:
@@ -76,13 +77,15 @@ private:
         try {
             while (true) {
                 if (queue.pop(event)) {
-                    graph.insert_edge(event.src, event.dst, event.timestamp, event.relation);
+                    graph.insert_edge(event.src, event.dst, event.timestamp, event.relation,
+                                      event.weight);
                     consumed.fetch_add(1, std::memory_order_relaxed);
                 } else if (stopping.load(std::memory_order_acquire)) {
                     // One last drain: stop() may have been signalled while
                     // items were still in flight.
                     if (!queue.pop(event)) break;
-                    graph.insert_edge(event.src, event.dst, event.timestamp, event.relation);
+                    graph.insert_edge(event.src, event.dst, event.timestamp, event.relation,
+                                      event.weight);
                     consumed.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     idle_polls.fetch_add(1, std::memory_order_relaxed);

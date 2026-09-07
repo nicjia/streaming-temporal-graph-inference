@@ -5,6 +5,7 @@
 #include <iostream>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -34,13 +35,8 @@ using EdgeList = std::multimap<uint32_t, std::pair<uint32_t, uint32_t>>;
 /// Reads every live edge back out of the PMA, exactly as a consumer would.
 EdgeList scan_graph(const PCSRGraph& g) {
     EdgeList found;
-    const uint32_t* offsets = g.get_vertex_offsets();
-    const uint32_t* counts = g.get_vertex_counts();
-    const TemporalEdge* edges = g.get_edges();
-
     for (uint32_t v = 0; v < g.get_num_vertices(); ++v) {
-        for (uint32_t i = 0; i < counts[v]; ++i) {
-            const TemporalEdge& e = edges[offsets[v] + i];
+        for (const TemporalEdge& e : g.neighbors(v)) {
             found.insert({v, {e.target_node, e.timestamp}});
         }
     }
@@ -57,26 +53,34 @@ void check_invariants(const PCSRGraph& g, const std::string& label) {
     check_eq(offsets[0], 0, label + ": first region starts at 0");
     check_eq(offsets[V], g.get_edge_capacity(), label + ": last region ends at capacity");
 
+    const uint32_t* starts = g.get_vertex_starts();
+
     uint64_t live = 0;
+    uint64_t dead = 0;
     for (uint32_t v = 0; v < V; ++v) {
         check(offsets[v] <= offsets[v + 1], label + ": offsets are monotonic at vertex " +
                                                 std::to_string(v));
         const uint32_t region = offsets[v + 1] - offsets[v];
-        check(counts[v] <= region, label + ": vertex " + std::to_string(v) +
-                                       " does not overflow its region");
+        const uint32_t used = starts[v] + counts[v];
+        check(used <= region, label + ": vertex " + std::to_string(v) +
+                                  " does not overflow its region");
 
-        // Live edges must occupy a packed prefix; gaps only ever follow them.
-        for (uint32_t i = 0; i < counts[v]; ++i) {
+        // Live edges must occupy a packed run; gaps only ever follow them. The
+        // expired prefix ahead of the run still holds its old edge records --
+        // it is dead, not blanked -- so the gap check starts past it.
+        for (uint32_t i = starts[v]; i < used; ++i) {
             check(edges[offsets[v] + i].target_node != EMPTY_GAP,
                   label + ": no hole inside vertex " + std::to_string(v) + "'s run");
         }
-        for (uint32_t i = counts[v]; i < region; ++i) {
+        for (uint32_t i = used; i < region; ++i) {
             check(edges[offsets[v] + i].target_node == EMPTY_GAP,
                   label + ": no live edge past vertex " + std::to_string(v) + "'s count");
         }
         live += counts[v];
+        dead += starts[v];
     }
     check_eq(live, g.get_num_edges(), label + ": counts sum to reported edge total");
+    check_eq(dead, g.get_dead_slots(), label + ": expired prefixes sum to dead_slots");
 }
 
 /// Insert `edges` and assert not a single one is lost or altered.
@@ -478,6 +482,145 @@ void test_cache_alignment() {
              "edges is 64-byte aligned");
 }
 
+void test_edge_weights() {
+    std::cout << "Edge weights ride alongside their edges\n";
+    PCSRGraph g(64, 128, 16 * 1024 * 1024, /*store_weights=*/true);
+
+    // Enough to force rebalances and at least one growth, so the weights have
+    // to survive both copy paths, not just the O(1) insert.
+    const uint32_t PER_VERTEX = 200;
+    for (uint32_t v = 0; v < 64; ++v) {
+        for (uint32_t i = 0; i < PER_VERTEX; ++i) {
+            g.insert_edge(v, (v * 7 + i) % 64, 1000 + i,
+                          static_cast<EdgeRelation>(i % 11),
+                          static_cast<float>(v) + static_cast<float>(i) / 1024.0f);
+        }
+    }
+    check(g.get_resize_count() > 0, "the case actually grew the PMA");
+    check_invariants(g, "weights");
+
+    bool intact = true;
+    for (uint32_t v = 0; v < 64; ++v) {
+        const auto run = g.neighbors(v);
+        const auto weights = g.neighbor_weights(v);
+        check_eq(run.size(), PER_VERTEX, "vertex keeps every edge");
+        for (size_t i = 0; i < run.size(); ++i) {
+            const float want = static_cast<float>(v) +
+                               static_cast<float>(run[i].timestamp - 1000) / 1024.0f;
+            if (weights[i] != want) intact = false;
+        }
+    }
+    check(intact, "every weight still matches its edge after rebalance and growth");
+
+    // The default must stay 0.0f so callers that never pass a weight are
+    // unaffected.
+    PCSRGraph plain(4, 16, 1024 * 1024, /*store_weights=*/true);
+    plain.insert_edge(0, 1, 500);
+    check(plain.neighbor_weights(0)[0] == 0.0f, "unspecified weight defaults to zero");
+
+    // Weights are off by default, and a graph without them must refuse a
+    // non-zero weight rather than drop it on the floor.
+    PCSRGraph unweighted(4, 16, 1024 * 1024);
+    check(!unweighted.has_weights(), "weights are off unless asked for");
+    unweighted.insert_edge(0, 1, 500);
+    check(unweighted.neighbor_weights(0).empty(), "an unweighted graph reports no weights");
+    check_eq(unweighted.get_num_edges(), 1, "an unweighted graph still stores edges");
+
+    bool threw = false;
+    try { unweighted.insert_edge(0, 2, 501, 0, 1.5f); }
+    catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "a non-zero weight into an unweighted graph throws");
+    check_eq(unweighted.get_num_edges(), 1, "the rejected insert did not land");
+}
+
+void test_expiry() {
+    std::cout << "Expiring old edges\n";
+    PCSRGraph g(32, 4096, 16 * 1024 * 1024, /*store_weights=*/true);
+
+    for (uint32_t v = 0; v < 32; ++v) {
+        for (uint32_t t = 0; t < 100; ++t) {
+            g.insert_edge(v, (v + t) % 32, 1000 + t, 0, static_cast<float>(t));
+        }
+    }
+    check_eq(g.get_num_edges(), 3200, "graph is fully populated");
+
+    // Nothing older than the first timestamp, so this must be a no-op.
+    check_eq(g.expire_before(1000), 0, "expiring before the oldest edge removes nothing");
+    check_eq(g.get_dead_slots(), 0, "a no-op expiry leaves no dead slots");
+
+    check_eq(g.expire_before(1040), 32 * 40, "expiry removes exactly the old prefix");
+    check_eq(g.get_num_edges(), 3200 - 32 * 40, "edge count drops by what was removed");
+    check_eq(g.get_expired_edges(), 32 * 40, "lifetime expiry counter tracks removals");
+    check_eq(g.get_dead_slots(), 32 * 40, "dead slots are held until a rebalance");
+    check_invariants(g, "after expiry");
+
+    // Survivors must be exactly the recent ones, still in order, still paired
+    // with their own weights.
+    bool survivors_correct = true;
+    for (uint32_t v = 0; v < 32; ++v) {
+        const auto run = g.neighbors(v);
+        const auto weights = g.neighbor_weights(v);
+        if (run.size() != 60) { survivors_correct = false; continue; }
+        for (size_t i = 0; i < run.size(); ++i) {
+            if (run[i].timestamp != 1040 + i) survivors_correct = false;
+            if (weights[i] != static_cast<float>(40 + i)) survivors_correct = false;
+        }
+    }
+    check(survivors_correct, "survivors are the recent edges, ordered, with their weights");
+
+    // Inserting after an expiry must land past the dead prefix, not on top of
+    // a survivor.
+    g.insert_edge(0, 5, 9999, 0, 42.0f);
+    const auto run = g.neighbors(0);
+    check_eq(run.size(), 61, "insert after expiry appends");
+    check_eq(run[60].timestamp, 9999, "the appended edge is the newest");
+    check_eq(run[0].timestamp, 1040, "the oldest survivor is untouched");
+    check_invariants(g, "insert after expiry");
+
+    // Expiring everything is legal and leaves an empty but valid graph.
+    PCSRGraph all(8, 256, 4 * 1024 * 1024);
+    for (uint32_t i = 0; i < 100; ++i) all.insert_edge(i % 8, (i + 1) % 8, 1000 + i);
+    check_eq(all.expire_before(2000), 100, "expiring past the newest empties the graph");
+    check_eq(all.get_num_edges(), 0, "no edges remain");
+    check_invariants(all, "fully expired");
+    all.insert_edge(3, 4, 3000);
+    check_eq(all.get_num_edges(), 1, "an emptied graph still accepts inserts");
+    check_invariants(all, "refilled after full expiry");
+}
+
+void test_expiry_reclaims_space() {
+    std::cout << "Expired slots are reclaimed by rebalancing\n";
+    // A sliding window: insert a batch, expire the batch before it, repeat.
+    // Without reclamation the PMA would grow without bound; the point of the
+    // test is that it does not.
+    PCSRGraph g(16, 2048, 8 * 1024 * 1024);
+
+    const uint32_t BATCHES = 400;
+    const uint32_t PER_BATCH = 16;
+    uint32_t now = 1000;
+    for (uint32_t b = 0; b < BATCHES; ++b) {
+        for (uint32_t i = 0; i < PER_BATCH; ++i) {
+            g.insert_edge(i % 16, (i * 3) % 16, now);
+        }
+        ++now;
+        // Keep only the last two batches.
+        if (b >= 2) g.expire_before(now - 2);
+    }
+
+    check(g.get_num_edges() <= 2 * PER_BATCH,
+          "the window holds only the recent batches");
+    check_invariants(g, "sliding window");
+
+    // 400 batches at 16 edges each is 6,400 insertions against a 2,048-slot
+    // PMA. If expired space were never returned the array would have had to
+    // double at least twice; reclamation is what keeps it at its original size.
+    check_eq(g.get_resize_count(), 0, "a bounded window never grows the PMA");
+    check(g.get_dead_slots() < g.get_edge_capacity(),
+          "dead slots do not accumulate to fill the array");
+    check_eq(g.get_expired_edges(), BATCHES * PER_BATCH - g.get_num_edges(),
+             "every edge that left the window is accounted for");
+}
+
 void test_arena_exhaustion() {
     std::cout << "Arena exhaustion\n";
     // 1 MB cannot back a 10M-slot PMA; this must be a clean throw, not a crash.
@@ -504,6 +647,9 @@ int main() {
     test_arena_exhaustion_mid_resize();
     test_boundaries();
     test_cache_alignment();
+    test_edge_weights();
+    test_expiry();
+    test_expiry_reclaims_space();
     test_arena_exhaustion();
 
     std::cout << "\n" << (g_checks - g_failures) << "/" << g_checks << " checks passed\n";

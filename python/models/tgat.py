@@ -41,10 +41,12 @@ class TemporalAttentionLayer(nn.Module):
         out_dim: Width of the output representation.
         num_heads: Attention heads. out_dim must be divisible by this.
         dropout: Applied to attention weights and to the output projection.
+        relation_dim: Width of an optional categorical edge-type encoding.
+        edge_dim: Width of an optional projected scalar edge payload.
     """
 
     def __init__(self, node_dim, time_dim, out_dim, num_heads=2, dropout=0.1,
-                 relation_dim=0):
+                 relation_dim=0, edge_dim=0):
         super().__init__()
         if out_dim % num_heads != 0:
             raise ValueError(f"out_dim ({out_dim}) must be divisible by "
@@ -66,8 +68,9 @@ class TemporalAttentionLayer(nn.Module):
         # a sanction and a summit between the same pair at the same lag can now
         # receive different weight, which the model previously could not express.
         self.relation_dim = relation_dim
+        self.edge_dim = edge_dim
         query_dim = node_dim + time_dim
-        key_dim = node_dim + time_dim + relation_dim
+        key_dim = node_dim + time_dim + relation_dim + edge_dim
 
         self.q_proj = nn.Linear(query_dim, out_dim, bias=False)
         self.k_proj = nn.Linear(key_dim, out_dim, bias=False)
@@ -91,7 +94,7 @@ class TemporalAttentionLayer(nn.Module):
                          else nn.Linear(node_dim, out_dim, bias=False))
 
     def forward(self, target_h, target_time_enc, neighbor_h, neighbor_time_enc, mask,
-                neighbor_relation_enc=None):
+                neighbor_relation_enc=None, neighbor_edge_enc=None):
         """
         Args:
             target_h: (B, node_dim) representation of each query node.
@@ -112,6 +115,11 @@ class TemporalAttentionLayer(nn.Module):
                 raise ValueError("layer was built with relation_dim > 0 but no "
                                  "relation encoding was supplied")
             kv_parts.append(neighbor_relation_enc)
+        if self.edge_dim:
+            if neighbor_edge_enc is None:
+                raise ValueError("layer was built with edge_dim > 0 but no "
+                                 "edge encoding was supplied")
+            kv_parts.append(neighbor_edge_enc)
         kv_in = torch.cat(kv_parts, dim=-1)
 
         # (B, H, 1, dh) and (B, H, K, dh)
@@ -168,11 +176,15 @@ class TGAT(nn.Module):
         node_features: Optional (num_nodes, node_dim) float array to use
             instead of a learned table. GDELT actors carry no features, so the
             default learns them.
+        edge_dim: If positive, project the graph's scalar edge weights to this
+            width and include them in attention keys and values. The graph must
+            have been constructed with ``store_weights=True``.
     """
 
     def __init__(self, num_nodes, sampler, node_dim=64, time_dim=64, num_layers=2,
                  num_neighbors=20, num_heads=2, dropout=0.1, strategy="recent",
-                 node_features=None, num_relations=0, relation_dim=16):
+                 node_features=None, num_relations=0, relation_dim=16,
+                 edge_dim=0):
         super().__init__()
         self.num_nodes = num_nodes
         self.sampler = sampler
@@ -207,9 +219,21 @@ class TGAT(nn.Module):
         if self.relation_embedding is not None:
             nn.init.normal_(self.relation_embedding.weight, std=0.1)
 
+        # A PMA edge can optionally carry one scalar payload (trade return,
+        # size, exposure, etc.). Projecting it before attention lets event
+        # magnitude affect both key selection and the value passed forward.
+        # The scalar is expected to be scaled by the caller from training data.
+        self.edge_dim = edge_dim
+        if edge_dim and not sampler.has_weights:
+            raise ValueError("edge_dim requires a graph constructed with "
+                             "store_weights=True")
+        self.edge_encoder = (nn.Sequential(nn.Linear(1, edge_dim), nn.Tanh())
+                             if edge_dim else None)
+
         self.layers = nn.ModuleList([
             TemporalAttentionLayer(node_dim, time_dim, node_dim, num_heads, dropout,
-                                   relation_dim=self.relation_dim)
+                                   relation_dim=self.relation_dim,
+                                   edge_dim=self.edge_dim)
             for _ in range(num_layers)
         ])
 
@@ -244,12 +268,21 @@ class TGAT(nn.Module):
             strategy=self.strategy,
             rng=self._rng if self.strategy == "uniform" else None,
             with_relations=self.num_relations > 0,
+            with_weights=self.edge_dim > 0,
         )
-        if self.num_relations:
+        if self.num_relations and self.edge_dim:
+            (neighbor_ids, neighbor_times, mask, neighbor_relations,
+             neighbor_weights) = sampled
+        elif self.num_relations:
             neighbor_ids, neighbor_times, mask, neighbor_relations = sampled
+            neighbor_weights = None
+        elif self.edge_dim:
+            neighbor_ids, neighbor_times, mask, neighbor_weights = sampled
+            neighbor_relations = None
         else:
             neighbor_ids, neighbor_times, mask = sampled
             neighbor_relations = None
+            neighbor_weights = None
 
         batch = nodes.shape[0]
         flat_ids = neighbor_ids.reshape(-1).astype(np.int64)
@@ -280,8 +313,15 @@ class TGAT(nn.Module):
             relation_enc = self.relation_embedding(
                 torch.as_tensor(codes, dtype=torch.long, device=self.device))
 
+        edge_enc = None
+        if self.edge_dim:
+            weights = torch.as_tensor(neighbor_weights, dtype=torch.float32,
+                                      device=self.device).unsqueeze(-1)
+            edge_enc = self.edge_encoder(weights)
+
         return self.layers[depth - 1](h, target_time_enc, neighbor_h,
-                                      neighbor_time_enc, mask_tensor, relation_enc)
+                                      neighbor_time_enc, mask_tensor,
+                                      relation_enc, edge_enc)
 
 
 class LinkPredictor(nn.Module):

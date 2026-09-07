@@ -5,8 +5,11 @@
 #include <string>
 
 // Layout recap: the out-edges of vertex v live in edges[vertex_offsets[v] ..
-// vertex_offsets[v+1]). The first vertex_counts[v] slots of that region are
-// live edges; everything after is a gap holding EMPTY_GAP.
+// vertex_offsets[v+1]). Within that region the first vertex_starts[v] slots
+// hold expired edges, the next vertex_counts[v] hold live ones, and everything
+// after is a gap holding EMPTY_GAP. vertex_starts is zero everywhere until
+// expire_before() is called, so a graph that never expires has exactly the
+// layout it had before expiry existed.
 
 namespace {
 
@@ -68,13 +71,16 @@ void fill_gaps(TemporalEdge* dst, size_t count) {
 
 } // namespace
 
-PCSRGraph::PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity, size_t arena_bytes)
+PCSRGraph::PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity,
+                     size_t arena_bytes, bool store_weights)
     : num_vertices(max_vertices),
       edge_capacity(initial_edge_capacity < max_vertices ? max_vertices : initial_edge_capacity),
       num_edges(0),
       rebalance_count(0),
       resize_count(0),
       slots_rewritten(0),
+      expired_edges(0),
+      dead_slots(0),
       writer_active(false),
       arena(arena_bytes) {
 
@@ -87,14 +93,20 @@ PCSRGraph::PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity, size
         arena.allocate((static_cast<size_t>(num_vertices) + 1) * sizeof(uint32_t)));
     vertex_counts = static_cast<uint32_t*>(
         arena.allocate(static_cast<size_t>(num_vertices) * sizeof(uint32_t)));
+    vertex_starts = static_cast<uint32_t*>(
+        arena.allocate(static_cast<size_t>(num_vertices) * sizeof(uint32_t)));
     edges = static_cast<TemporalEdge*>(
         arena.allocate(static_cast<size_t>(edge_capacity) * sizeof(TemporalEdge)));
     edge_relations = static_cast<EdgeRelation*>(
         arena.allocate(static_cast<size_t>(edge_capacity) * sizeof(EdgeRelation)));
+    edge_weights = store_weights ? static_cast<float*>(
+        arena.allocate(static_cast<size_t>(edge_capacity) * sizeof(float))) : nullptr;
     scratchpad_edges = static_cast<TemporalEdge*>(
         arena.allocate(static_cast<size_t>(edge_capacity) * sizeof(TemporalEdge)));
     scratchpad_relations = static_cast<EdgeRelation*>(
         arena.allocate(static_cast<size_t>(edge_capacity) * sizeof(EdgeRelation)));
+    scratchpad_weights = store_weights ? static_cast<float*>(
+        arena.allocate(static_cast<size_t>(edge_capacity) * sizeof(float))) : nullptr;
     scratchpad_counts = static_cast<uint32_t*>(
         arena.allocate(static_cast<size_t>(num_vertices) * sizeof(uint32_t)));
     scratchpad_gaps = static_cast<uint32_t*>(
@@ -106,7 +118,12 @@ PCSRGraph::PCSRGraph(uint32_t max_vertices, uint32_t initial_edge_capacity, size
     static_assert(RELATION_UNKNOWN == 0, "byte-fill assumes a zero sentinel");
     std::memset(edge_relations, 0,
                 static_cast<size_t>(edge_capacity) * sizeof(EdgeRelation));
+    if (edge_weights) {
+        // 0.0f is all-zero bytes under IEEE-754, which every target here uses.
+        std::memset(edge_weights, 0, static_cast<size_t>(edge_capacity) * sizeof(float));
+    }
     std::memset(vertex_counts, 0, static_cast<size_t>(num_vertices) * sizeof(uint32_t));
+    std::memset(vertex_starts, 0, static_cast<size_t>(num_vertices) * sizeof(uint32_t));
 
     // Empty graph: every slot is spare, so this hands each vertex an equal
     // region (plus one extra to the first `edge_capacity % num_vertices`).
@@ -125,7 +142,7 @@ PCSRGraph::~PCSRGraph() {
 }
 
 void PCSRGraph::insert_edge(uint32_t src, uint32_t dst, uint32_t timestamp,
-                            EdgeRelation relation) {
+                            EdgeRelation relation, float weight) {
     if (src >= num_vertices || dst >= num_vertices) {
         throw std::out_of_range("requested node is nonexistent. nodes go from 0 to " +
                                 std::to_string(num_vertices - 1) + ".");
@@ -134,22 +151,35 @@ void PCSRGraph::insert_edge(uint32_t src, uint32_t dst, uint32_t timestamp,
     const uint32_t start = vertex_offsets[src];
     const uint32_t region = vertex_offsets[src + 1] - start;
     const uint32_t count = vertex_counts[src];
+    // Expired edges still hold their slots, so the write position is past them.
+    // used == count on any graph that has never expired.
+    const uint32_t used = vertex_starts[src] + count;
 
     // Fast path: regions stay left-packed, so the next free slot is known
     // without scanning. This is the O(1) common case.
-    if (count < region) [[likely]] {
-        edges[start + count] = {dst, timestamp};
-        edge_relations[start + count] = relation;
+    // Rejecting rather than dropping. The compare is against a register and
+    // stays off the memory path, so it costs nothing measurable; silently
+    // discarding a weight would not show up until someone read zeros back.
+    if (weight != 0.0f && !edge_weights) [[unlikely]] {
+        throw std::invalid_argument(
+            "PCSRGraph: this graph was built without weights, so a non-zero "
+            "weight cannot be stored. Construct it with store_weights=true.");
+    }
+
+    if (used < region) [[likely]] {
+        edges[start + used] = {dst, timestamp};
+        edge_relations[start + used] = relation;
+        if (edge_weights) edge_weights[start + used] = weight;
         vertex_counts[src] = count + 1;
         ++num_edges;
         return;
     }
 
-    rebalance_and_insert(src, dst, timestamp, relation);
+    rebalance_and_insert(src, dst, timestamp, relation, weight);
 }
 
 void PCSRGraph::rebalance_and_insert(uint32_t src, uint32_t dst, uint32_t timestamp,
-                                     EdgeRelation relation) {
+                                     EdgeRelation relation, float weight) {
     // Walk up power-of-two windows of vertices centred on src's aligned block
     // until one is loose enough to absorb the insert. Doubling (rather than
     // widening by one vertex at a time) is what makes the amortized cost
@@ -176,6 +206,17 @@ void PCSRGraph::rebalance_and_insert(uint32_t src, uint32_t dst, uint32_t timest
         const uint32_t win_end = vertex_offsets[v_end + 1];
         const uint64_t win_capacity = win_end - win_st;
 
+        // Live edges only. Expired prefixes are deliberately not counted, even
+        // though they physically hold slots right now, because redistribute()
+        // drops them -- so what has to fit in this window is the survivors, not
+        // the garbage.
+        //
+        // Counting them would invert the intent: a window is escalated when it
+        // is too dense, and escalating past a window that is mostly expired
+        // walks all the way to the top and resizes the PMA, which is precisely
+        // the wrong move when a single rewrite would have freed everything. A
+        // sliding window over 16 vertices doubled its array twice under that
+        // reading; counting live only, it never grows at all.
         uint64_t occupied = 1; // the edge we are about to add
         for (uint32_t v = v_start; v <= v_end; ++v) {
             occupied += vertex_counts[v];
@@ -193,13 +234,14 @@ void PCSRGraph::rebalance_and_insert(uint32_t src, uint32_t dst, uint32_t timest
         const uint64_t limit = (win_capacity * 3) / 4;
 
         if (occupied <= limit) {
-            redistribute(v_start, v_end, src, dst, timestamp, relation);
+            redistribute(v_start, v_end, src, dst, timestamp, relation, weight);
             return;
         }
 
         if (full_array) [[unlikely]] {
             resize_pma(src);
-            insert_edge(src, dst, timestamp, relation); // retry against the doubled PMA
+            // retry against the doubled PMA
+            insert_edge(src, dst, timestamp, relation, weight);
             return;
         }
     }
@@ -207,7 +249,7 @@ void PCSRGraph::rebalance_and_insert(uint32_t src, uint32_t dst, uint32_t timest
 
 void PCSRGraph::redistribute(uint32_t v_start, uint32_t v_end,
                              uint32_t src, uint32_t dst, uint32_t timestamp,
-                             EdgeRelation relation) {
+                             EdgeRelation relation, float weight) {
     const uint32_t win_st = vertex_offsets[v_start];
     const uint32_t win_end = vertex_offsets[v_end + 1];
     const uint32_t win_capacity = win_end - win_st;
@@ -218,24 +260,37 @@ void PCSRGraph::redistribute(uint32_t v_start, uint32_t v_end,
 
     // Pass 1: lift every live edge in the window into the scratchpad, in
     // vertex order, splicing the new edge into src's run as we pass it.
+    //
+    // Expired prefixes are skipped rather than copied, so this pass is also
+    // where expiry actually returns memory. Nothing extra is done for it: the
+    // dead slots simply are not carried across, and pass 2 lays the survivors
+    // down from the window start with vertex_starts reset to zero.
+    // Hoisted so the copy loop does not re-test it per slot.
+    const bool weighted = edge_weights != nullptr;
+
     uint32_t scratch_idx = 0;
+    uint64_t reclaimed = 0;
     for (uint32_t v = v_start; v <= v_end; ++v) {
-        const uint32_t region_start = vertex_offsets[v];
+        const uint32_t live_start = vertex_offsets[v] + vertex_starts[v];
         uint32_t count = vertex_counts[v];
+        reclaimed += vertex_starts[v];
 
         for (uint32_t i = 0; i < count; ++i) {
-            // Relations move in lockstep with their edges; the two arrays are
-            // only meaningful while their indices agree.
-            scratchpad_relations[scratch_idx] = edge_relations[region_start + i];
-            scratchpad_edges[scratch_idx++] = edges[region_start + i];
+            // Relations and weights move in lockstep with their edges; the
+            // arrays are only meaningful while their indices agree.
+            scratchpad_relations[scratch_idx] = edge_relations[live_start + i];
+            if (weighted) scratchpad_weights[scratch_idx] = edge_weights[live_start + i];
+            scratchpad_edges[scratch_idx++] = edges[live_start + i];
         }
         if (v == src) {
             scratchpad_relations[scratch_idx] = relation;
+            if (weighted) scratchpad_weights[scratch_idx] = weight;
             scratchpad_edges[scratch_idx++] = {dst, timestamp};
             ++count;
         }
         scratchpad_counts[v - v_start] = count;
     }
+    dead_slots -= reclaimed;
 
     const uint32_t total = scratch_idx;
 
@@ -257,9 +312,11 @@ void PCSRGraph::redistribute(uint32_t v_start, uint32_t v_end,
 
         vertex_offsets[v_start + i] = cursor;
         vertex_counts[v_start + i] = count;
+        vertex_starts[v_start + i] = 0;  // dead prefix reclaimed by this pass
         for (uint32_t j = 0; j < count; ++j) {
             edges[cursor + j] = scratchpad_edges[consumed];
             edge_relations[cursor + j] = scratchpad_relations[consumed];
+            if (weighted) edge_weights[cursor + j] = scratchpad_weights[consumed];
             ++consumed;
         }
         cursor += count + scratchpad_gaps[i];
@@ -293,6 +350,11 @@ void PCSRGraph::resize_pma(uint32_t hot) {
         arena.allocate(static_cast<size_t>(new_capacity) * sizeof(EdgeRelation)));
     EdgeRelation* new_scratch_relations = static_cast<EdgeRelation*>(
         arena.allocate(static_cast<size_t>(new_capacity) * sizeof(EdgeRelation)));
+    const bool weighted = edge_weights != nullptr;
+    float* new_weights = weighted ? static_cast<float*>(
+        arena.allocate(static_cast<size_t>(new_capacity) * sizeof(float))) : nullptr;
+    float* new_scratch_weights = weighted ? static_cast<float*>(
+        arena.allocate(static_cast<size_t>(new_capacity) * sizeof(float))) : nullptr;
     // A fresh offsets array: the old one has to stay readable while we walk it.
     uint32_t* new_offsets = static_cast<uint32_t*>(
         arena.allocate((static_cast<size_t>(num_vertices) + 1) * sizeof(uint32_t)));
@@ -300,28 +362,75 @@ void PCSRGraph::resize_pma(uint32_t hot) {
     fill_gaps(new_edges, new_capacity);
     std::memset(new_relations, 0,
                 static_cast<size_t>(new_capacity) * sizeof(EdgeRelation));
+    if (weighted) {
+        std::memset(new_weights, 0, static_cast<size_t>(new_capacity) * sizeof(float));
+    }
 
     const uint32_t spare = new_capacity - static_cast<uint32_t>(num_edges);
     distribute_gaps(vertex_counts, num_vertices, num_edges, spare, scratchpad_gaps, hot);
 
+    // Growth compacts too: only live edges cross to the new array, so any
+    // expired prefix is dropped here as well.
     uint32_t cursor = 0;
     for (uint32_t v = 0; v < num_vertices; ++v) {
-        const uint32_t old_start = vertex_offsets[v];
+        const uint32_t live_start = vertex_offsets[v] + vertex_starts[v];
         const uint32_t count = vertex_counts[v];
 
         new_offsets[v] = cursor;
         for (uint32_t i = 0; i < count; ++i) {
-            new_edges[cursor + i] = edges[old_start + i];
-            new_relations[cursor + i] = edge_relations[old_start + i];
+            new_edges[cursor + i] = edges[live_start + i];
+            new_relations[cursor + i] = edge_relations[live_start + i];
+            if (weighted) new_weights[cursor + i] = edge_weights[live_start + i];
         }
+        vertex_starts[v] = 0;
         cursor += count + scratchpad_gaps[v];
     }
     new_offsets[num_vertices] = new_capacity;
+    dead_slots = 0;
 
     edges = new_edges;
     edge_relations = new_relations;
+    edge_weights = new_weights;
     scratchpad_edges = new_scratch;
     scratchpad_relations = new_scratch_relations;
+    scratchpad_weights = new_scratch_weights;
     vertex_offsets = new_offsets;
     edge_capacity = new_capacity;
+}
+
+uint32_t PCSRGraph::expire_vertex_before(uint32_t vertex, uint32_t timestamp) {
+    if (vertex >= num_vertices) {
+        throw std::out_of_range("requested node is nonexistent. nodes go from 0 to " +
+                                std::to_string(num_vertices - 1) + ".");
+    }
+
+    const TemporalEdge* run = edges + vertex_offsets[vertex] + vertex_starts[vertex];
+    const uint32_t count = vertex_counts[vertex];
+
+    // Linear from the front rather than a bisection. The scan costs O(edges
+    // actually removed), which beats O(log degree) in the case this exists for
+    // -- a sliding window trimmed often, where each sweep drops a handful of
+    // edges per vertex -- and matches it when the whole run goes.
+    uint32_t removed = 0;
+    while (removed < count && run[removed].timestamp < timestamp) {
+        ++removed;
+    }
+    if (removed == 0) {
+        return 0;
+    }
+
+    vertex_starts[vertex] += removed;
+    vertex_counts[vertex] = count - removed;
+    num_edges -= removed;
+    expired_edges += removed;
+    dead_slots += removed;
+    return removed;
+}
+
+uint64_t PCSRGraph::expire_before(uint32_t timestamp) {
+    uint64_t removed = 0;
+    for (uint32_t v = 0; v < num_vertices; ++v) {
+        removed += expire_vertex_before(v, timestamp);
+    }
+    return removed;
 }

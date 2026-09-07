@@ -20,8 +20,9 @@ class PCSRTemporalSampler:
 
     First, each vertex's adjacency is a single contiguous, gap-free run --
     regions are left-packed, so vertex v's live edges are exactly
-    edges[offsets[v] : offsets[v] + counts[v]]. No gap-skipping, and the run is
-    usually one or two cache lines.
+    edges[run_starts[v] : run_starts[v] + counts[v]], where run_starts is
+    offsets plus the expired prefix (zero unless the graph has been expired).
+    No gap-skipping, and the run is usually one or two cache lines.
 
     Second, if events were inserted in chronological order then every run is
     sorted ascending by timestamp, because rebalancing and growth both preserve
@@ -53,19 +54,30 @@ class PCSRTemporalSampler:
         internal pointers, and a numpy array handed out earlier still aliases
         the old, now-abandoned arena block. It would read stale data rather
         than fail, so re-acquiring is not optional.
+
+        Also required after expire_before(): the views themselves stay valid,
+        but the run boundaries they describe have moved.
         """
         self.offsets = np.asarray(self.graph.get_vertex_offsets())
         self.counts = np.asarray(self.graph.get_vertex_counts())
+        # Where each vertex's live run begins inside its region. Zero
+        # everywhere unless the graph has expired something, so `run_starts`
+        # equals `offsets[:-1]` on a graph that only ever grows.
+        self.starts = np.asarray(self.graph.get_vertex_starts())
+        self.run_starts = self.offsets[:self.starts.size] + self.starts
         edges = np.asarray(self.graph.get_edges())
         self.edge_targets = edges[:, 0]
         self.edge_times = edges[:, 1]
         self.edge_relations = np.asarray(self.graph.get_edge_relations())
+        # Empty unless the graph was built with store_weights=True.
+        self.edge_weights = np.asarray(self.graph.get_edge_weights())
+        self.has_weights = self.edge_weights.size > 0
         self.num_vertices = int(self.graph.num_vertices)
 
     def validate(self):
         """True if every adjacency run is ascending in time."""
         for v in range(self.num_vertices):
-            start = self.offsets[v]
+            start = self.run_starts[v]
             times = self.edge_times[start:start + self.counts[v]]
             if times.size > 1 and np.any(np.diff(times.astype(np.int64)) < 0):
                 return False
@@ -83,7 +95,7 @@ class PCSRTemporalSampler:
         that very edge -- and at every other edge in its bucket -- as evidence.
         The model would score beautifully and have learned nothing.
         """
-        starts = self.offsets[nodes]
+        starts = self.run_starts[nodes]
         ends = starts + self.counts[nodes]
 
         lo = starts.copy()
@@ -173,7 +185,7 @@ class PCSRTemporalSampler:
         return features.astype(np.float32)
 
     def sample(self, nodes, times, num_neighbors, strategy="recent", rng=None,
-               with_relations=False):
+               with_relations=False, with_weights=False):
         """
         Args:
             nodes: (B,) vertex ids.
@@ -190,6 +202,8 @@ class PCSRTemporalSampler:
             neighbor_relations: (B, K) uint16, zero where masked. Only returned
                 when `with_relations` is set, so existing two-hop callers keep
                 their three-tuple.
+            neighbor_weights: (B, K) float32, zero where masked. Appended only
+                when `with_weights` is set, for the same reason.
 
         Nodes with no admissible history come back fully masked rather than
         dropped, so the batch keeps a fixed shape and the attention layer can
@@ -230,8 +244,13 @@ class PCSRTemporalSampler:
         neighbor_ids = np.where(mask, self.edge_targets[safe], 0).astype(np.uint32)
         neighbor_times = np.where(mask, self.edge_times[safe], 0).astype(np.int64)
 
-        if not with_relations:
-            return neighbor_ids, neighbor_times, mask
-
-        neighbor_relations = np.where(mask, self.edge_relations[safe], 0).astype(np.uint16)
-        return neighbor_ids, neighbor_times, mask, neighbor_relations
+        result = (neighbor_ids, neighbor_times, mask)
+        if with_relations:
+            result += (np.where(mask, self.edge_relations[safe], 0).astype(np.uint16),)
+        if with_weights:
+            if not self.has_weights:
+                raise ValueError(
+                    "this graph carries no edge weights; construct it with "
+                    "PCSRGraph(..., store_weights=True)")
+            result += (np.where(mask, self.edge_weights[safe], 0.0).astype(np.float32),)
+        return result

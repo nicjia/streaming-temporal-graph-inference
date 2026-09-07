@@ -185,7 +185,7 @@ void test_streaming_ingestor() {
 
     constexpr uint32_t VERTICES = 512;
     constexpr uint32_t EVENTS = 300000;
-    PCSRGraph graph(VERTICES, EVENTS * 2, 128u * 1024 * 1024);
+    PCSRGraph graph(VERTICES, EVENTS * 2, 128u * 1024 * 1024, /*store_weights=*/true);
 
     {
         // Deliberately small queue so the producer hits back-pressure
@@ -196,7 +196,8 @@ void test_streaming_ingestor() {
 
         for (uint32_t i = 0; i < EVENTS; ++i) {
             ingestor.push({i % VERTICES, (i * 7) % VERTICES, 1000 + i,
-                           static_cast<EdgeRelation>(i % 19 + 1)});
+                           static_cast<EdgeRelation>(i % 19 + 1),
+                           static_cast<float>(i) * 0.25f});
         }
         ingestor.drain();
         check_eq(ingestor.get_consumed(), EVENTS, "consumer drains everything pushed");
@@ -210,19 +211,23 @@ void test_streaming_ingestor() {
 
     uint64_t scanned = 0;
     bool relations_intact = true;
+    bool weights_intact = true;
     for (uint32_t v = 0; v < VERTICES; ++v) {
         const auto run = graph.neighbors(v);
         const auto rels = graph.neighbor_relations(v);
+        const auto weights = graph.neighbor_weights(v);
         scanned += run.size();
         for (size_t i = 0; i < run.size(); ++i) {
-            // relation was derived from the event index, which also set the
-            // timestamp, so the pairing is checkable after the fact.
+            // relation and weight were derived from the event index, which also
+            // set the timestamp, so the pairing is checkable after the fact.
             const uint32_t index = run[i].timestamp - 1000;
             if (rels[i] != static_cast<EdgeRelation>(index % 19 + 1)) relations_intact = false;
+            if (weights[i] != static_cast<float>(index) * 0.25f) weights_intact = false;
         }
     }
     check_eq(scanned, EVENTS, "a full scan agrees with the reported count");
     check(relations_intact, "relations survive the queue handoff intact");
+    check(weights_intact, "weights survive the queue handoff intact");
 
     // The guard must be released once streaming stops.
     graph.insert_edge(0, 1, 999999);

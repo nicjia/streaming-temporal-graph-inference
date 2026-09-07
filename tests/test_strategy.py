@@ -541,6 +541,112 @@ def test_reversal_baseline():
 
 
 
+def test_edge_weights_roundtrip():
+    print("\nEdge weights through the Python stack")
+    import graph_engine
+    from models import PCSRTemporalSampler
+
+    rng = np.random.default_rng(23)
+    num_nodes, num_edges = 40, 20000
+    src = rng.integers(0, num_nodes, num_edges).astype(np.uint32)
+    dst = rng.integers(0, num_nodes, num_edges).astype(np.uint32)
+    ts = np.sort(rng.integers(1_000, 90_000, num_edges)).astype(np.uint32)
+    # Weight derived from the timestamp, so a mismatch is detectable anywhere.
+    weight = (ts.astype(np.float32) / 8.0).astype(np.float32)
+
+    graph = graph_engine.PCSRGraph(num_nodes, 256, 128 * 1024 * 1024,
+                                   store_weights=True)  # forces growth
+    graph.insert_edges(src, dst, ts, None, weight)
+    check(graph.resize_count > 0, "weights survive a growing PMA")
+
+    _, _, coo_ts, _, coo_w = graph.to_coo()
+    check(np.allclose(coo_w, coo_ts.astype(np.float32) / 8.0),
+          "to_coo weights match their own timestamps")
+
+    sampler = PCSRTemporalSampler(graph)
+    nodes = rng.integers(0, num_nodes, 256)
+    times = rng.integers(40_000, 90_000, 256).astype(np.int64)
+    ids, n_times, mask, weights = sampler.sample(nodes, times, 8, with_weights=True)
+    check(weights.shape == ids.shape, "sampled weights match the neighbour shape")
+    check(bool(np.allclose(weights[mask], n_times[mask].astype(np.float32) / 8.0)),
+          "each sampled neighbour carries its own weight")
+    check(bool((weights[~mask] == 0).all()), "masked slots carry no weight")
+
+    # Omitting weights must stay backwards compatible, and a graph built
+    # without them must not silently accept one.
+    plain = graph_engine.PCSRGraph(num_nodes, 4096, 16 * 1024 * 1024,
+                                   store_weights=True)
+    plain.insert_edges(src[:1000], dst[:1000], ts[:1000])
+    check(float(np.asarray(plain.get_edge_weights())[:1000].sum()) == 0.0,
+          "unspecified weights default to zero")
+
+    unweighted = graph_engine.PCSRGraph(num_nodes, 4096, 16 * 1024 * 1024)
+    check(not unweighted.has_weights, "weights are off by default")
+    check(np.asarray(unweighted.get_edge_weights()).size == 0,
+          "an unweighted graph exposes an empty weight view")
+    unweighted.insert_edges(src[:1000], dst[:1000], ts[:1000])
+    check(int(unweighted.num_edges) == 1000, "an unweighted graph still stores edges")
+    try:
+        unweighted.insert_edges(src[:10], dst[:10], ts[:10], None, weight[:10])
+        raised = False
+    except ValueError:
+        raised = True
+    check(raised, "weights into an unweighted graph raise instead of vanishing")
+
+
+def test_expiry_through_sampler():
+    print("\nExpiry keeps a bounded window causally correct")
+    import graph_engine
+    from models import PCSRTemporalSampler
+
+    rng = np.random.default_rng(77)
+    num_nodes, num_edges = 60, 40000
+    src = rng.integers(0, num_nodes, num_edges).astype(np.uint32)
+    dst = rng.integers(0, num_nodes, num_edges).astype(np.uint32)
+    ts = np.sort(rng.integers(1_000, 100_000, num_edges)).astype(np.uint32)
+
+    graph = graph_engine.PCSRGraph(num_nodes, 8192, 128 * 1024 * 1024)
+    graph.insert_edges(src, dst, ts)
+
+    cutoff = 60_000
+    survivors = int((ts >= cutoff).sum())
+    removed = graph.expire_before(cutoff)
+    check(removed == num_edges - survivors,
+          f"expire_before drops exactly the old edges ({removed})")
+    check(int(graph.num_edges) == survivors, "the live count is the survivor count")
+    check(int(np.asarray(graph.get_vertex_counts()).sum()) == survivors,
+          "a full scan agrees with the reported count")
+
+    # The sampler must see the new boundaries, and must still refuse to look
+    # forward: an expired graph is a truncated history, not a shifted one.
+    sampler = PCSRTemporalSampler(graph)
+    check(sampler.validate(), "runs are still chronological after expiry")
+
+    nodes = rng.integers(0, num_nodes, 512)
+    times = rng.integers(70_000, 100_000, 512).astype(np.int64)
+    ids, n_times, mask = sampler.sample(nodes, times, 12)
+    check(bool((n_times[mask] < times[:, None].repeat(12, axis=1)[mask]).all()),
+          "no sampled neighbour is at or after its query time")
+    check(bool((n_times[mask] >= cutoff).all()),
+          "no expired edge is reachable through the sampler")
+
+    # Against a reference computed directly from the arrays.
+    expected = np.zeros(len(nodes), dtype=np.int64)
+    for i, (node, time) in enumerate(zip(nodes, times)):
+        expected[i] = int(((src == node) & (ts >= cutoff) & (ts < time)).sum())
+    check(bool((mask.sum(axis=1) == np.minimum(expected, 12)).all()),
+          "admissible-history sizes match a brute-force count")
+
+    # Continuing to insert after expiry must not corrupt anything.
+    more_src = rng.integers(0, num_nodes, 5000).astype(np.uint32)
+    more_dst = rng.integers(0, num_nodes, 5000).astype(np.uint32)
+    more_ts = np.sort(rng.integers(100_000, 120_000, 5000)).astype(np.uint32)
+    graph.insert_edges(more_src, more_dst, more_ts)
+    check(int(graph.num_edges) == survivors + 5000, "inserts after expiry all land")
+    sampler.refresh()
+    check(sampler.validate(), "runs are still chronological after expiry then insert")
+
+
 def test_edge_relations_roundtrip():
     print("\nEdge relations through the Python stack")
     import graph_engine
@@ -569,7 +675,7 @@ def test_edge_relations_roundtrip():
           "each sampled neighbour carries its own relation")
 
     # to_coo must agree with the zero-copy views.
-    s_arr, d_arr, t_arr, r_arr = graph.to_coo()
+    s_arr, d_arr, t_arr, r_arr, w_arr = graph.to_coo()
     check(len(r_arr) == int(graph.num_edges), "to_coo returns one relation per edge")
     check(bool((r_arr == ((d_arr.astype(np.int64) * 7 + 3) % 20 + 1)).all()),
           "to_coo relations match their targets")
@@ -672,7 +778,7 @@ def test_bulk_matches_scalar():
                          np.asarray(scalar.get_vertex_counts())),
           "degrees are identical")
 
-    for name, left, right in zip(("src", "dst", "timestamp", "relation"),
+    for name, left, right in zip(("src", "dst", "timestamp", "relation", "weight"),
                                  bulk.to_coo(), scalar.to_coo()):
         check(np.array_equal(left, right), f"{name} column is identical")
 
@@ -1220,6 +1326,8 @@ def main():
     test_information_coefficient()
     test_reversal_baseline()
     test_edge_relations_roundtrip()
+    test_edge_weights_roundtrip()
+    test_expiry_through_sampler()
     test_bulk_matches_scalar()
     test_single_writer_guard()
     test_determinism()
