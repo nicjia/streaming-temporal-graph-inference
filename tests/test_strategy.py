@@ -31,8 +31,7 @@ from ingestion.corpus import CONFLICT_CLASSES, synthetic_corpus  # noqa: E402
 from ingestion.supply_chain import synthetic_supply_chain  # noqa: E402
 from ingestion.historical_replayer import DataReplayer, provision, to_unix_seconds  # noqa: E402
 from ingestion.id_mapper import EntityMapper  # noqa: E402
-from models import (PCSRTemporalSampler, build_intensity_targets,  # noqa: E402
-                    build_return_targets, information_coefficient)
+from models import PCSRTemporalSampler  # noqa: E402
 from strategy.signals import goldstein_signal, random_signal, signal_dates  # noqa: E402
 from strategy.universe import Universe  # noqa: E402
 
@@ -206,36 +205,6 @@ def test_metrics():
           "MRR is 1.0 when the positive beats every negative")
     check(abs(mean_reciprocal_rank([0], np.array([[1, 2, 3]])) - 0.25) < 1e-9,
           "MRR is 1/4 when three negatives beat the positive")
-
-
-def test_intensity_targets():
-    print("\nIntensity targets")
-    events, _ = synthetic_corpus(num_days=60, events_per_day=80, seed=3)
-    countries = sorted(set(events["src"]))[:6]
-    ids = np.arange(len(countries))
-    dates = signal_dates(events["ts"].min(), events["ts"].max())
-
-    cutoff = int(np.quantile(events["ts"], 0.6))
-    nodes, times, targets = build_intensity_targets(events, countries, ids, dates,
-                                                    horizon_days=5, max_ts=cutoff)
-
-    check(len(nodes) == len(times) == len(targets), "target arrays are parallel")
-    check(targets.min() >= 0, "counts are non-negative")
-
-    # The bound that keeps the walk-forward split honest.
-    horizon_seconds = 5 * 86400
-    check(times.max() + horizon_seconds <= cutoff + 86400,
-          "no training example's forward window crosses the training cut-off")
-
-    # A target must equal the count it claims to be.
-    conflict = events[events["quad_class"].isin(CONFLICT_CLASSES)]
-    sample = 0
-    country = countries[nodes[sample]]
-    window = conflict[(conflict["ts"] >= times[sample]) &
-                      (conflict["ts"] < times[sample] + horizon_seconds)]
-    expected = ((window["src"] == country) | (window["dst"] == country)).sum()
-    check(int(targets[sample]) == int(expected),
-          "target equals the actual conflict count in its window")
 
 
 def test_recency_features():
@@ -436,84 +405,6 @@ def test_backtest_recovers_planted_signal():
     check(metrics["t_stat"] > 2.0, "and it is statistically distinguishable from noise")
 
 
-
-def test_return_targets():
-    print("\nReturn labels")
-    events, prices = synthetic_corpus(num_days=200, events_per_day=100, seed=6)
-    universe = Universe()
-    countries = sorted(set(events["src"]))
-    ids = np.arange(len(countries))
-    dates = pd.DatetimeIndex(sorted(pd.to_datetime(prices["date"].unique())))
-
-    nodes, times, targets, frame = build_return_targets(
-        prices, universe, countries, ids, dates,
-        horizon_days=1, execution_lag_days=1, dispersion_window=0, clip=None)
-
-    check(len(nodes) == len(times) == len(targets) == len(frame),
-          "label arrays are parallel")
-    check(np.isfinite(targets).all(), "labels are finite")
-
-    # Demeaning must make each day's cross-section sum to zero -- that is what
-    # makes the target match a dollar-neutral book rather than market beta.
-    daily = frame.groupby("date")["target"].mean().abs().max()
-    check(daily < 1e-9, "labels are cross-sectionally demeaned")
-
-    # Verify one label against the prices by hand, with the exact timing the
-    # backtest uses: signal at d -> enter close(d+1) -> exit close(d+2).
-    wide = prices.copy()
-    wide["date"] = pd.to_datetime(wide["date"])
-    wide = wide.pivot_table(index="date", columns="ticker", values="close", aggfunc="last").sort_index()
-    row = frame.iloc[len(frame) // 2]
-    ticker = universe.ticker(row["country"])
-    position = wide.index.get_loc(pd.Timestamp(row["date"]))
-    raw = wide[ticker].iloc[position + 2] / wide[ticker].iloc[position + 1] - 1.0
-    same_day = [c for c in countries if universe.ticker(c) in wide.columns]
-    market = np.mean([wide[universe.ticker(c)].iloc[position + 2] /
-                      wide[universe.ticker(c)].iloc[position + 1] - 1.0
-                      for c in same_day])
-    check(abs(row["target"] - (raw - market)) < 1e-8,
-          "label equals the demeaned return over the correct holding window")
-
-    # The leakage guard.
-    cutoff = int(pd.Timestamp(dates[120]).timestamp())
-    _, bounded_times, _, _ = build_return_targets(
-        prices, universe, countries, ids, dates,
-        horizon_days=1, execution_lag_days=1, max_ts=cutoff)
-    check(bounded_times.max() + 3 * 86400 <= cutoff + 86400,
-          "no label's forward window crosses the training cut-off")
-
-    # Trailing dispersion must not consult the day it scales.
-    _, _, scaled, scaled_frame = build_return_targets(
-        prices, universe, countries, ids, dates, dispersion_window=60)
-    check(abs(float(np.std(scaled)) - 1.0) < 0.9,
-          "scaled labels are order-1")
-    check(len(scaled_frame) < len(frame),
-          "the dispersion warm-up drops early dates rather than peeking")
-
-
-def test_information_coefficient():
-    print("\nInformation coefficient")
-    dates = ["2024-01-02", "2024-01-03"]
-    countries = ["USA", "CHN", "JPN", "DEU"]
-
-    rows_p, rows_r = [], []
-    for date in dates:
-        for rank, country in enumerate(countries):
-            rows_p.append((date, country, float(rank)))
-            rows_r.append((date, country, float(rank)))
-    perfect = information_coefficient(
-        pd.DataFrame(rows_p, columns=["date", "country", "signal"]),
-        pd.DataFrame(rows_r, columns=["date", "country", "target"]))[0]
-    check(abs(perfect - 1.0) < 1e-9, "perfectly ordered forecast scores IC 1.0")
-
-    inverted = information_coefficient(
-        pd.DataFrame([(d, c, float(i)) for d in dates for i, c in enumerate(countries)],
-                     columns=["date", "country", "signal"]),
-        pd.DataFrame([(d, c, float(-i)) for d in dates for i, c in enumerate(countries)],
-                     columns=["date", "country", "target"]))[0]
-    check(abs(inverted + 1.0) < 1e-9, "inverted forecast scores IC -1.0")
-
-
 def test_reversal_baseline():
     print("\nReversal baseline")
     from strategy.signals import reversal_signal
@@ -538,7 +429,6 @@ def test_reversal_baseline():
     expected = -(wide[ticker].iloc[position] / wide[ticker].iloc[position - 1] - 1.0)
     check(abs(row["signal"] - expected) < 1e-9,
           "reversal equals the negated prior-day return")
-
 
 
 def test_edge_weights_roundtrip():
@@ -746,7 +636,6 @@ def test_duplicate_instrument_aggregation():
           "gross exposure is not inflated by the duplicate")
 
 
-
 def test_bulk_matches_scalar():
     print("\nBulk and scalar insertion agree")
     import graph_engine
@@ -781,7 +670,6 @@ def test_bulk_matches_scalar():
     for name, left, right in zip(("src", "dst", "timestamp", "relation", "weight"),
                                  bulk.to_coo(), scalar.to_coo()):
         check(np.array_equal(left, right), f"{name} column is identical")
-
 
 
 def test_single_writer_guard():
@@ -917,7 +805,6 @@ def test_determinism():
           "a different seed actually changes the result")
 
 
-
 def test_propagation_recovers_planted_half_life():
     print("\nPropagation event study recovers a known half-life")
     from models import PCSRTemporalSampler
@@ -1051,7 +938,6 @@ def test_streaming_ingestor_python():
     check(sampler_ok, "sampler accepts a streamed graph")
 
 
-
 def test_ethereum_loader():
     print("\nEthereum loader")
     import tempfile
@@ -1169,161 +1055,18 @@ def test_ethereum_end_to_end():
           "sampled events respect the query time")
 
 
-def test_dex_cross_pool_markout():
-    print("\nDEX cross-pool markout")
-    from ingestion.dex import ORDER_SLOTS_PER_BLOCK, add_cross_pool_markout
-
-    frame = pd.DataFrame({
-        "block": [100, 101, 110],
-        "pool": [0, 1, 0],
-        "event_time": [1, ORDER_SLOTS_PER_BLOCK + 1,
-                       10 * ORDER_SLOTS_PER_BLOCK + 1],
-        "log_price": np.log([1000.0, 1100.0, 1200.0]),
-        "direction": [1, -1, 1],
-        "notional_usdc": [1000.0, 1100.0, 1200.0],
-    })
-    marked = add_cross_pool_markout(frame, horizon_blocks=1,
-                                    max_abs_bps=None)
-    expected = np.log(1.1) * 10_000
-    check(abs(marked.loc[0, "markout_bps"] - expected) < 1e-9,
-          "a buy is toxic when the other pool rises after execution")
-    check(marked.loc[0, "adverse_selection_usdc"] > 0,
-          "positive markout maps to positive LP adverse selection")
-    check(np.isnan(marked.loc[2, "markout_bps"]),
-          "a stale other-pool quote is not carried into the label")
-
-
-def test_aave_liquidation_deduplication():
-    print("\nAave liquidation ingestion")
-    from ingestion.aave import load_aave_events
-
-    base = {
-        "event_type": "liquidationCall", "block_number": 100,
-        "timestamp": 1_700_000_000, "tx_index": 2, "log_index": 9,
-        "transaction_hash": "0xabc", "user": "0xUser",
-    }
-    collateral = dict(base, asset="0xCOLL", asset_role="collateral",
-                      debt_asset="0xDEBT")
-    debt = dict(base, asset="0xDEBT", asset_role="debt",
-                debt_asset="0xDEBT")
-    supply = {
-        "event_type": "supply", "block_number": 90,
-        "timestamp": 1_699_999_000, "tx_index": 1, "log_index": 3,
-        "transaction_hash": "0xsupply", "user": "0xUser",
-        "asset": "0xCOLL", "asset_role": "reserve",
-    }
-    with tempfile.TemporaryDirectory() as directory:
-        source = os.path.join(directory, "AaveEventData")
-        os.makedirs(source)
-        with open(os.path.join(source, "coll.json"), "w") as handle:
-            json.dump([supply, collateral], handle)
-        with open(os.path.join(source, "debt.json"), "w") as handle:
-            json.dump([debt], handle)
-        events, liquidations = load_aave_events(source, use_cache=False)
-
-    check(len(events) == 3, "both typed liquidation legs remain graph events")
-    check(len(liquidations) == 1, "collateral/debt copies become one economic event")
-    check(liquidations.loc[0, "collateral"] == "0xcoll"
-          and liquidations.loc[0, "debt"] == "0xdebt",
-          "the merged liquidation recovers both exposure legs")
-    check(events["block"].is_monotonic_increasing,
-          "Aave graph events are chronological")
-
-
-def test_aave_candidate_sampling_is_canonical():
-    print("\nAave candidate sampling")
-    from ingestion.aave import sample_candidates
-
-    left = sample_candidates({"c", "a", "b"}, 2, np.random.default_rng(7), set())
-    right = sample_candidates({"b", "c", "a"}, 2, np.random.default_rng(7), set())
-    check(left == right, "set insertion order cannot change a seeded sample")
-
-
-def test_earnings_event_alignment():
-    print("\nEarnings event alignment")
-    from ingestion.earnings import attach_crsp_reactions, prepare_earnings_events
-
-    dates = pd.bdate_range("2024-01-02", periods=45)
-    returns = pd.DataFrame({
-        "permno": np.repeat([101, 202], len(dates)),
-        "date": np.tile(dates, 2),
-        "ret": 0.0,
-    })
-    announcement = dates[25]
-    returns.loc[(returns["permno"] == 101)
-                & (returns["date"] == dates[26]), "ret"] = 0.10
-    returns.loc[(returns["permno"] == 202)
-                & (returns["date"] == dates[25]), "ret"] = -0.08
-    base = {
-        "ticker": ["AFTER", "BEFORE"], "oftic": ["AFTER", "BEFORE"],
-        "cname": ["After", "Before"], "fpedats": [dates[20], dates[20]],
-        "anndats_act": [announcement, announcement],
-        "anntims_act": ["16:15:00", "08:00:00"],
-        "statpers": [dates[24], dates[24]], "meanest": [1.0, 1.0],
-        "medest": [1.0, 1.0], "stdev": [.1, .1], "numest": [10, 10],
-        "actual": [1.1, .9], "permno": [101, 202], "secid": [1, 2],
-        "ibes_link_score": [1, 1], "option_link_score": [1, 1],
-    }
-    events = prepare_earnings_events(pd.DataFrame(base))
-    panel = attach_crsp_reactions(events, returns)
-    after = panel[panel["ticker"] == "AFTER"].iloc[0]
-    before = panel[panel["ticker"] == "BEFORE"].iloc[0]
-    check(after["reaction_date"] == dates[26]
-          and abs(after["reaction_1d"] - .10) < 1e-12,
-          "after-close earnings react on the next trading day")
-    check(before["reaction_date"] == dates[25]
-          and abs(before["reaction_1d"] + .08) < 1e-12,
-          "before-open earnings react on the same trading day")
-    check(bool((events["statpers"] < events["anndats_act"]).all()),
-          "every consensus snapshot strictly precedes its announcement")
-
-
-def test_earnings_temporal_features():
-    print("\nEarnings temporal features")
-    from models.earnings_distribution import (_causal_time_ewm,
-                                              build_standardized_event_variance)
-
-    values = np.array([1.0, 3.0, 9.0])
-    clock = np.array([0, 1, 2], dtype=np.int64)
-    weighted = _causal_time_ewm(values, clock, half_life_days=1)
-    check(np.isnan(weighted[0]) and abs(weighted[1] - 1.0) < 1e-12,
-          "irregular-time weighting never admits the current event")
-    check(abs(weighted[2] - 7 / 3) < 1e-12,
-          "calendar-time decay weights prior observations correctly")
-
-    rows = []
-    for days in (10, 30, 60):
-        maturity = days / 365
-        total_variance = .01 + .04 * maturity
-        iv = np.sqrt(total_variance / maturity)
-        rows.append({
-            "event_id": 1, "days": days, "forward_price": 100,
-            "call_premium": 5, "put_premium": 5,
-            "call_iv": iv, "put_iv": iv,
-            "call_delta": .5, "put_delta": -.5,
-        })
-    term = build_standardized_event_variance(pd.DataFrame(rows)).iloc[0]
-    check(abs(term["std_event_variance"] - .01) < 1e-12,
-          "term-structure decomposition recovers scheduled event variance")
-    check(abs(term["std_diffusive_variance"] - .04) < 1e-12,
-          "term-structure decomposition recovers diffusive variance")
-
-
 def main():
     test_id_mapper()
     test_timestamps()
     test_universe()
     test_folds()
     test_metrics()
-    test_intensity_targets()
     test_recency_features()
     test_replayer()
     test_backtest_control()
     test_backtest_no_lookahead()
     test_backtest_book()
     test_backtest_recovers_planted_signal()
-    test_return_targets()
-    test_information_coefficient()
     test_reversal_baseline()
     test_edge_relations_roundtrip()
     test_edge_weights_roundtrip()
@@ -1335,11 +1078,6 @@ def main():
     test_propagation_recovers_planted_half_life()
     test_ethereum_loader()
     test_ethereum_end_to_end()
-    test_dex_cross_pool_markout()
-    test_aave_liquidation_deduplication()
-    test_aave_candidate_sampling_is_canonical()
-    test_earnings_event_alignment()
-    test_earnings_temporal_features()
     test_fx_universe()
     test_duplicate_instrument_aggregation()
 

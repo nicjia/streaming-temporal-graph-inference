@@ -79,3 +79,9 @@ python/ingestion/ 8-K fetch, constrained extraction, entity resolution
 benchmarks/       graph assembly and the link-prediction studies
 tests/            C++ (ctest + sanitizers) and Python tests
 ```
+
+## Other experiments
+
+- **Implementation validation.** The TGAT is checked against published JODIE (Kumar et al., 2019) numbers on Wikipedia/Reddit, landing in the reported range — the one study here with a known answer to falsify against.
+- **Ethereum link prediction.** The same next-edge task on a 3.2M-transaction on-chain graph reaches ~0.90 AUC on new links, where the graph is dense enough for temporal attention to pay off.
+- **Performance.** Microbenchmarks for insertion throughput, cache behaviour, and neighbour-sampling latency against baseline structures.
