@@ -694,13 +694,21 @@ def test_single_writer_guard():
     graph = graph_engine.PCSRGraph(num_nodes, 8 * per_thread, 1 << 28)
     rejected = []
 
+    # Precompute the payloads and release every writer from a barrier, so they
+    # enter insert_edges together. Building the batch inside the thread let a
+    # slow (2-core) runner finish one insert before the next started, so the
+    # guard never fired and the test flaked.
+    payloads = [batch(i) for i in range(4)]
+    start = threading.Barrier(len(payloads))
+
     def writer(payload):
+        start.wait()
         try:
             graph.insert_edges(*payload)
         except RuntimeError as error:
             rejected.append(str(error))
 
-    threads = [threading.Thread(target=writer, args=(batch(i),)) for i in range(4)]
+    threads = [threading.Thread(target=writer, args=(p,)) for p in payloads]
     for thread in threads:
         thread.start()
     for thread in threads:
